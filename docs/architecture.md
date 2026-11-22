@@ -7,12 +7,18 @@ changes can revisit them deliberately.
 ## Overview (v0.2.0)
 
 ```
-cmd/fleet-sim ────► internal/simulator ─────────────┐
-cmd/fleet-fusion ─► internal/fusion ────────────────┤
-cmd/fleet-eval ───► internal/evaluation ─┬► fusion  ├──► internal/telemetry
-                                         └► simulator│
-                    internal/protocol ───────────────┘
+cmd/fleet-sim ─────► internal/simulator ──────────────┐
+cmd/fleet-fusion ──► internal/fusion ─────────────────┤
+cmd/fleet-eval ────► internal/evaluation ─┬► fusion   │
+                                          └► simulator├──► internal/telemetry
+                     internal/protocol ───────────────┤
+                           ▲                          │
+cmd/fleet-gateway ─► internal/gateway ─┬► internal/eventstore (SQLite)
+                                       └► internal/sessions
 ```
+
+The event store and the gateway also use `internal/protocol`; the session
+registry uses only `internal/telemetry`.
 
 | Package               | Responsibility | Depends on |
 |-----------------------|----------------|------------|
@@ -21,9 +27,13 @@ cmd/fleet-eval ───► internal/evaluation ─┬► fusion  ├──► i
 | `internal/simulator`  | Deterministic synthetic fleet generator; test-only ground truth API. | telemetry |
 | `internal/fusion`     | Telemetry fusion engine: ordering, sessions, distance estimation, diagnostics. | telemetry |
 | `internal/evaluation` | Accuracy harness: simulator truth vs. engine vs. baselines. Tooling only. | fusion, simulator, telemetry |
+| `internal/eventstore` | Durable event storage; authoritative identity and deduplication. | protocol, telemetry, `modernc.org/sqlite` |
+| `internal/sessions`   | Bounded, in-memory session tracking and provisional ordering diagnostics. | telemetry |
+| `internal/gateway`    | UDP receiver with bounded queues, batching writer, graceful shutdown. | protocol, eventstore, sessions, telemetry |
 | `cmd/fleet-sim`       | CLI: simulator output as JSON Lines. | simulator, telemetry |
 | `cmd/fleet-fusion`    | CLI: JSON Lines samples in, fusion reports out. | fusion, telemetry |
 | `cmd/fleet-eval`      | CLI: prints the accuracy table. | evaluation |
+| `cmd/fleet-gateway`   | Executable running the ingestion pipeline. | gateway, eventstore, sessions |
 
 `telemetry` is the core of the dependency graph and depends on nothing else
 in the repository. `fusion` depends only on `telemetry`. A test
@@ -32,7 +42,13 @@ production estimation cannot see ground truth. The protocol, the simulator
 and the fusion engine are independent of each other; they meet only in
 tests, in the evaluation harness, and later in services that compose them.
 
-The fusion design is documented in [fusion.md](fusion.md).
+The ingestion pipeline (`gateway`, `eventstore`, `sessions`) and `fusion` do
+not import each other. The two subsystems are not connected yet: nothing
+feeds stored events to the fusion engine.
+
+The fusion design is documented in [fusion.md](fusion.md), the ingestion
+pipeline in [ingestion.md](ingestion.md), and the open differences between
+them in [integration.md](integration.md).
 
 ## ADR-1: One modular repository, one deployable unit (for now)
 
@@ -119,6 +135,9 @@ No third-party dependencies in v0.1.0. This minimises supply-chain risk and
 keeps the code approachable. Dependencies will be added only when they bring
 clear value (for example a metrics library for observability).
 
+*Amended by ADR-13:* the event store depends on a SQLite driver. All other
+packages remain standard-library only.
+
 ## ADR-8: Fusion as a synchronous, deterministic library
 
 **Context.** Fusion must later be fed by a UDP gateway and by replay from a
@@ -190,17 +209,78 @@ it; a new engine re-establishes baselines and counts from there
 Event Store exists, because recovery by deterministic replay (ADR-8) is
 simpler and more robust than snapshotting internal estimator state.
 
+## ADR-12: Durable identity is authoritative; session ordering is provisional
+
+**Context.** Devices retransmit, UDP reorders and duplicates, devices reboot,
+and the domain's "EventID is unique per device" is a convention that the
+reference simulator does not keep across reboots (its EventID embeds the
+per-boot sequence number).
+
+**Decision.** Event identity is `(DeviceID, BootID, EventID)`, enforced by a
+database `UNIQUE` constraint. A SHA-256 fingerprint of the canonical wire
+encoding tells retransmissions from conflicts. A retransmission has the same
+fingerprint and nothing is written. A conflict has a different fingerprint:
+the stored event is kept and the other payload is recorded separately.
+Including BootID means a reboot that restarts EventIDs creates new identities
+instead of conflicts. The domain contract ("EventID unique per device") is
+left unchanged. Violations of it are detected and reported (EventIDs reused
+across boots are counted and queryable), never used to reject data.
+
+Session analysis (gaps, reordering, reuse, boot transitions) lives in a
+separate in-memory registry. It sees only newly stored events and produces
+diagnostics, never filtering decisions. BootIDs are never ordered
+numerically; ambiguous chronology is reported explicitly.
+
+**Consequences.** Deduplication survives restarts and is shared by
+concurrent writers. Late or out-of-order telemetry is always stored. Session
+diagnostics are lost on restart and labelled provisional. The stored events
+contain everything needed to replay session history, but no automatic replay
+is implemented.
+
+A device that reuses both a BootID and an EventID within it collides. A
+different payload is then kept only in the conflict table. Fixing this needs
+a wider boot identifier on the wire, which is a protocol change. The gateway
+sends no ACKs, so senders get no delivery guarantee. Details in
+[ingestion.md](ingestion.md).
+
+## ADR-13: SQLite through `modernc.org/sqlite`
+
+**Context.** The event store needs durable, transactional, constraint-checked
+local storage without an external server. Go's standard library has
+`database/sql` but no database engine.
+
+**Decision.** SQLite, through `modernc.org/sqlite` **v1.38.2** (pinned in
+`go.mod`, with checksums in `go.sum`).
+
+**Rationale.**
+
+- SQLite provides transactions, `UNIQUE`/`CHECK`/foreign-key constraints, WAL
+  concurrency and crash safety in a single local file.
+- `modernc.org/sqlite` is a pure-Go translation of SQLite. It needs no cgo,
+  so the project still builds with `CGO_ENABLED=0`, cross-compiles, and builds
+  on CI's Windows runners without a C toolchain. The cgo-based
+  `mattn/go-sqlite3` would require one everywhere.
+- v1.38.2 is the newest release whose own `go.mod` requires only Go 1.23,
+  so adopting it does not raise the module's minimum Go version. Later
+  releases require Go 1.24–1.26; upgrading is a separate, deliberate step.
+
+**Costs.** A larger dependency tree (`modernc.org/libc` and helpers, all
+indirect) and slower raw throughput than the C build, which is acceptable at
+gateway batch sizes. Storage access stays behind the gateway's small
+`Appender` interface, so the engine can be replaced.
+
 ## Reserved architectural space
 
 These components are planned but **not** implemented; no placeholder
 packages exist for them. The expected placement is listed so that current
-APIs do not block them.
+APIs do not block them. (The fusion engine, UDP gateway, session registry
+and event store, once listed here, are implemented as `internal/fusion`,
+`internal/gateway`, `internal/sessions` and `internal/eventstore`.
+Connecting ingestion to fusion is open work; see
+[integration.md](integration.md).)
 
 | Component | Expected placement | Builds on |
 |-----------|--------------------|-----------|
-| UDP Gateway | `internal/gateway`, `cmd/fleet-gateway` | `protocol.DecodeSample`; sets `IngestedAt`; feeds `fusion.Engine.Process` |
-| Device Session Registry | `internal/session` | `BootID`, `Sequence`; could take over fusion's session tracking for all consumers |
-| Persistent Event Store | `internal/store` | `EventID` uniqueness per device; enables replay-based fusion recovery and reconciliation of late events |
 | Diagnostics and Observability | `internal/obs` | typed `protocol.Error` codes as metric labels |
 | Firmware Transfer Service | `internal/firmware` | new protocol message types (requires protocol v2) |
 | Command Dispatcher | `internal/command` | new protocol message types |
