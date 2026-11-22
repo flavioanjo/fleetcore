@@ -51,6 +51,7 @@ func TestIngestionIsDecoupledFromFusion(t *testing.T) {
 	allowed := map[string]bool{
 		"internal/telemetry": true, "internal/protocol": true,
 		"internal/eventstore": true, "internal/sessions": true,
+		"internal/sqlitedb": true, // shared SQLite configuration (no domain logic)
 	}
 	for _, dir := range []string{".", "../eventstore", "../sessions", "../../cmd/fleet-gateway"} {
 		for imp, file := range productionImports(t, dir) {

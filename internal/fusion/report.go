@@ -50,12 +50,16 @@ type Reason string
 
 // Reasons.
 const (
-	ReasonNone              Reason = ""
-	ReasonInvalidSample     Reason = "invalid_sample"     // failed telemetry validation
-	ReasonSequenceConflict  Reason = "sequence_conflict"  // same (boot, sequence) as a different event
-	ReasonStaleSession      Reason = "stale_session"      // belongs to a closed or older session
-	ReasonDeviceCapacity    Reason = "device_capacity"    // engine already tracks MaxDevices devices
-	ReasonSequenceExhausted Reason = "sequence_exhausted" // the session reached the maximum sequence number; wrap-around is unsupported
+	ReasonNone             Reason = ""
+	ReasonInvalidSample    Reason = "invalid_sample"    // failed telemetry validation
+	ReasonSequenceConflict Reason = "sequence_conflict" // same (boot, sequence) as a different event
+	ReasonStaleSession     Reason = "stale_session"     // belongs to a closed or older session
+	ReasonDeviceCapacity   Reason = "device_capacity"   // engine already tracks MaxDevices devices
+	// ReasonSequenceExhausted is no longer produced: sequence numbers are
+	// extended internally and wrap-around is supported. Kept so that stored
+	// reports from earlier versions still decode to a named reason.
+	ReasonSequenceExhausted Reason = "sequence_exhausted"
+	ReasonSequenceAmbiguous Reason = "sequence_ambiguous" // too far from the session's position (serial arithmetic) to be placed
 	ReasonLateAfterGap      Reason = "late_after_gap"     // its sequence slot was declared missing
 	ReasonBeyondTracking    Reason = "beyond_tracking"    // older than duplicate/gap tracking; duplicate or late cannot be told apart
 )
@@ -172,6 +176,7 @@ const (
 	CodeDeviceClockAhead    Code = "device_clock_ahead"
 	CodeRepeatedTimestamp   Code = "repeated_timestamp"
 	CodeClockRegression     Code = "clock_regression"
+	CodeSequenceAmbiguous   Code = "sequence_ambiguous"
 
 	// Measurements.
 	CodeSourceUnavailable      Code = "source_unavailable"

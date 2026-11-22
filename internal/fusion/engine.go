@@ -227,12 +227,17 @@ func (d *device) process(e *Engine, s telemetry.Sample, out *reports) {
 	}
 
 	ss := d.cur
-	outcome, reason := ss.classify(s)
+	outcome, reason, ext := ss.classify(s)
 	if outcome != OutcomeAccepted {
+		if reason == ReasonSequenceAmbiguous {
+			notes = append(notes, diag(CodeSequenceAmbiguous, LevelWarning, fmt.Sprintf(
+				"sequence %d is %d or more numbers away from this session's position (serial arithmetic); its place cannot be determined, not applied",
+				s.Sequence, serialLimit)))
+		}
 		out.event(e, s, outcome, reason, notes...)
 		return
 	}
-	ss.insert(s)
+	ss.insert(s, ext)
 	rel := ss.release(cfg, false)
 	releasedNow := false
 	for _, r := range rel {
@@ -271,7 +276,7 @@ func (d *device) apply(e *Engine, rel []released, out *reports, self *telemetry.
 		}
 		if r.gap != nil {
 			notes = append(notes, diag(CodeSequenceGap, LevelWarning, "preceded by missing sequence numbers").
-				withSeq(r.gap.from).withValue(int64(r.gap.to-r.gap.from)+1))
+				withSeq(r.gap.fromSeq()).withValue(r.gap.count()))
 		}
 		out.event(e, r.sample, OutcomeAccepted, ReasonNone, notes...)
 		out.estimates(e, d.est.ingest(r.sample))

@@ -30,6 +30,10 @@ session registry ──► provisional diagnostics (logs, counters)
 | `internal/sessions` | In-memory, bounded session tracking and ordering diagnostics. |
 | `cmd/fleet-gateway` | Executable wiring the three together. |
 
+Several gateway processes can share one event store; deduplication and the
+central ingestion order (store position) span all of them. The cross-gateway
+ordering caveats are in processing.md §1.
+
 None of them imports `internal/fusion` or `internal/simulator` (the simulator
 is used in tests only). No Task 001 contract (`internal/telemetry`,
 `internal/protocol`, `docs/protocol.md`) was changed.
@@ -283,6 +287,9 @@ Tests cover:
   another opener holds the lock).
 
 ### SQLite settings
+
+These settings are implemented once in `internal/sqlitedb` and shared with
+the results database of the processor (processing.md §5).
 
 | Setting | Value | Why |
 |---------|-------|-----|

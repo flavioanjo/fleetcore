@@ -7,23 +7,22 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/flavioanjo/fleetcore/internal/protocol"
+	"github.com/flavioanjo/fleetcore/internal/sqlitedb"
 	"github.com/flavioanjo/fleetcore/internal/telemetry"
-
-	// Pure-Go SQLite (no cgo). Registers the "sqlite" database/sql driver.
-	"modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Errors returned by the store.
 var (
-	ErrNotFound     = errors.New("eventstore: event not found")
-	ErrClosed       = errors.New("eventstore: store is closed")
-	ErrSchemaTooNew = errors.New("eventstore: database schema is newer than this build")
+	ErrNotFound = errors.New("eventstore: event not found")
+	ErrClosed   = errors.New("eventstore: store is closed")
+	// ErrSchemaTooNew is sqlitedb.ErrSchemaTooNew: the database was
+	// migrated by a newer build.
+	ErrSchemaTooNew = sqlitedb.ErrSchemaTooNew
 	ErrCorrupt      = errors.New("eventstore: stored event failed integrity check")
 )
 
@@ -40,23 +39,13 @@ type Options struct {
 	Now func() time.Time
 }
 
-// Store is a SQLite-backed event store.
+// Store is a SQLite-backed event store. The SQLite configuration (WAL,
+// synchronous=FULL, a single BEGIN IMMEDIATE writer, a query_only read pool,
+// checkpoint on close) is documented in internal/sqlitedb.
 //
-// SQLite configuration:
-//   - journal_mode=WAL: readers never block the writer and vice versa.
-//   - synchronous=FULL: a committed transaction survives power loss (WAL
-//     with NORMAL could lose the most recent commits).
-//   - busy_timeout: see Options.BusyTimeout.
-//   - foreign_keys=ON.
-//   - Write pool: exactly one connection, and every write transaction is
-//     BEGIN IMMEDIATE, so writes in this process are serialized by
-//     database/sql and writes from other processes wait on busy_timeout
-//     instead of failing with lock-upgrade deadlocks.
-//   - Read pool: Options.ReadConns connections opened with query_only=ON.
-//   - Close: checkpoints and truncates the WAL, then closes both pools.
-//
-// Store is safe for concurrent use.
+// Store is safe for concurrent use, also by several processes on one file.
 type Store struct {
+	db   *sqlitedb.DB
 	w, r *sql.DB
 	now  func() time.Time
 
@@ -69,106 +58,16 @@ type Store struct {
 // Open opens (creating if needed) the database at path and migrates it to
 // the current schema.
 func Open(ctx context.Context, path string, opts Options) (*Store, error) {
-	if path == "" {
-		return nil, errors.New("eventstore: empty database path")
-	}
-	if opts.BusyTimeout <= 0 {
-		opts.BusyTimeout = 5 * time.Second
-	}
-	if opts.ReadConns <= 0 {
-		opts.ReadConns = 4
-	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-
-	common := url.Values{}
-	common.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", opts.BusyTimeout.Milliseconds()))
-	common.Add("_pragma", "foreign_keys(1)")
-	common.Add("_pragma", "synchronous(FULL)")
-
-	wq := cloneValues(common)
-	wq.Add("_pragma", "journal_mode(WAL)")
-	wq.Set("_txlock", "immediate")
-	w, err := sql.Open("sqlite", path+"?"+wq.Encode())
+	db, err := sqlitedb.Open(ctx, "eventstore", path, sqlitedb.Options{
+		BusyTimeout: opts.BusyTimeout, ReadConns: opts.ReadConns, Now: opts.Now,
+	}, migrations)
 	if err != nil {
-		return nil, fmt.Errorf("eventstore: open: %w", err)
-	}
-	w.SetMaxOpenConns(1)
-	w.SetMaxIdleConns(1)
-	w.SetConnMaxLifetime(0)
-	w.SetConnMaxIdleTime(0)
-
-	// Connecting applies the pragmas. Switching a new database to WAL needs
-	// an exclusive lock and SQLite does not invoke the busy handler for it,
-	// so concurrent first opens are retried here, bounded by BusyTimeout.
-	if err := retryBusy(ctx, opts.BusyTimeout, func() error { return w.PingContext(ctx) }); err != nil {
-		w.Close()
-		return nil, fmt.Errorf("eventstore: open %s: %w", path, err)
-	}
-	var mode string
-	if err := w.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&mode); err != nil || mode != "wal" {
-		w.Close()
-		return nil, fmt.Errorf("eventstore: could not enable WAL (journal_mode=%q): %v", mode, err)
-	}
-	if err := migrate(ctx, w, opts.Now()); err != nil {
-		w.Close()
 		return nil, err
 	}
-
-	rq := cloneValues(common)
-	rq.Add("_pragma", "query_only(1)")
-	r, err := sql.Open("sqlite", path+"?"+rq.Encode())
-	if err != nil {
-		w.Close()
-		return nil, fmt.Errorf("eventstore: open reader: %w", err)
-	}
-	r.SetMaxOpenConns(opts.ReadConns)
-	r.SetMaxIdleConns(opts.ReadConns)
-	if err := r.PingContext(ctx); err != nil {
-		r.Close()
-		w.Close()
-		return nil, fmt.Errorf("eventstore: open reader: %w", err)
-	}
-	return &Store{w: w, r: r, now: opts.Now}, nil
-}
-
-// retryBusy runs fn until it succeeds, fails with an error other than
-// SQLITE_BUSY/SQLITE_LOCKED, or limit elapses.
-func retryBusy(ctx context.Context, limit time.Duration, fn func() error) error {
-	deadline := time.Now().Add(limit)
-	delay := time.Millisecond
-	for {
-		err := fn()
-		if err == nil || !isBusy(err) || time.Now().After(deadline) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return err
-		case <-time.After(delay):
-		}
-		if delay < 50*time.Millisecond {
-			delay *= 2
-		}
-	}
-}
-
-func isBusy(err error) bool {
-	var se *sqlite.Error
-	if !errors.As(err, &se) {
-		return false
-	}
-	code := se.Code() & 0xff // primary result code
-	return code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED
-}
-
-func cloneValues(v url.Values) url.Values {
-	out := url.Values{}
-	for k, vs := range v {
-		out[k] = append([]string(nil), vs...)
-	}
-	return out
+	return &Store{db: db, w: db.W, r: db.R, now: opts.Now}, nil
 }
 
 // Close checkpoints the WAL and closes the database. It waits for in-flight
@@ -179,12 +78,9 @@ func (s *Store) Close() error {
 		s.mu.Lock()
 		s.closed = true
 		s.mu.Unlock()
-		var errs []error
-		if _, err := s.w.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-			errs = append(errs, fmt.Errorf("eventstore: checkpoint: %w", err))
+		if err := s.db.Close(); err != nil {
+			s.closeErr = fmt.Errorf("eventstore: close: %w", err)
 		}
-		errs = append(errs, s.r.Close(), s.w.Close())
-		s.closeErr = errors.Join(errs...)
 	})
 	return s.closeErr
 }
@@ -392,6 +288,41 @@ func (s *Store) ReadAfter(ctx context.Context, after int64, limit int) ([]Record
 func (s *Store) ByEventID(ctx context.Context, dev telemetry.DeviceID, eid telemetry.EventID) ([]Record, error) {
 	return s.query(ctx, `SELECT position, packet, fingerprint, ingested_at_ns, stored_at_ns
 		FROM events WHERE device_id = ? AND event_id = ? ORDER BY position`, string(dev), int64(eid))
+}
+
+// ByPositions returns the stored events at the given positions, in the
+// order requested. Every position must exist (ErrNotFound otherwise);
+// repeated positions are returned repeatedly. Consumers that persist
+// positions, such as the chronological processor's journal, use it to
+// re-read exactly the events they processed.
+func (s *Store) ByPositions(ctx context.Context, positions []int64) ([]Record, error) {
+	const chunk = 500 // stays well below SQLite's bound-parameter limit
+	found := make(map[int64]Record, len(positions))
+	for start := 0; start < len(positions); start += chunk {
+		part := positions[start:min(start+chunk, len(positions))]
+		q := `SELECT position, packet, fingerprint, ingested_at_ns, stored_at_ns FROM events WHERE position IN (?` +
+			strings.Repeat(",?", len(part)-1) + `)`
+		args := make([]any, len(part))
+		for i, p := range part {
+			args[i] = p
+		}
+		recs, err := s.query(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range recs {
+			found[r.Position] = r
+		}
+	}
+	out := make([]Record, len(positions))
+	for i, p := range positions {
+		r, ok := found[p]
+		if !ok {
+			return nil, fmt.Errorf("%w: position %d", ErrNotFound, p)
+		}
+		out[i] = r
+	}
+	return out, nil
 }
 
 func (s *Store) query(ctx context.Context, q string, args ...any) ([]Record, error) {

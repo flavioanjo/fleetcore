@@ -8,6 +8,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -31,7 +32,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	samples := fs.Int("samples", 2000, "rounds per vehicle")
 	interval := fs.Duration("interval", 10*time.Second, "simulation interval")
 	perturb := fs.Bool("perturb", false, "also run with delivery perturbations (reorder, duplicates, drops, late events)")
+	fs.Usage = func() {
+		fmt.Fprintln(stderr, "usage: fleet-eval [flags]")
+		fmt.Fprintln(stderr, "Prints fusion accuracy against simulator ground truth as a Markdown table.")
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0 // help was requested: not a usage error
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "fleet-eval: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
 	var seedList []uint64

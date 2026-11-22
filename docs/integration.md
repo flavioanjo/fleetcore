@@ -8,11 +8,12 @@ FleetCore now has two subsystems that consume the same telemetry:
 - **Fusion** ([fusion.md](fusion.md)): `internal/fusion`. It orders events
   and estimates distance travelled.
 
-They were developed independently (Tasks 002 and 003) and **are not
-connected**: nothing feeds stored events to `fusion.Engine`. This document
-records where their rules differ, what that implies for a future
-integration, and which decisions remain open. It changes no behaviour, and
-no protocol or domain contract.
+They were developed independently (Tasks 002 and 003). **Task 004 connects
+them** through the chronological processor (`internal/chrono`,
+`internal/processor`, `cmd/fleet-processor`; see
+[processing.md](processing.md)). This document records where the two
+subsystems' rules differ, what that implies, and which points Task 004
+resolved. No protocol or domain contract was changed.
 
 ## Coupling
 
@@ -67,34 +68,21 @@ decision (strengthening the per-boot EventID guarantee in
 
 ## 2. Sequence wrap-around
 
+*Resolved in Task 004 (ADR-16).*
+
 | | Rule |
 |---|---|
-| Domain (`telemetry.Sequence`) | "It may wrap around after 2³²−1." |
-| Session registry | Serial-number arithmetic (RFC 1982 style). Wrap is handled; a jump of ≥ 2³¹ is indistinguishable from going backwards. |
-| Fusion engine | After releasing 2³²−1, further events of that session are `rejected` / `sequence_exhausted` (fusion.md §9 item 6). |
-| Event store | Not affected: Sequence is not part of the identity. Post-wrap events are stored. |
-| Reference simulator | Derives EventID as `vehicle << 32 \| sequence`, so a wrap would also corrupt its EventIDs. Not reachable in practice. |
+| Domain (`telemetry.Sequence`) | "It may wrap around after 2³²−1." Unchanged. |
+| Fusion engine | Internal 64-bit extension by bounded serial arithmetic. A wrap is continuous; a number 2³⁰ or more from the session's position is `rejected` / `sequence_ambiguous`. |
+| Chronological processor | The same rule (`chrono.Extender`, pinned to fusion's by `TestExtenderParityWithChrono`); ambiguous numbers are flagged and delivered in ingestion order. |
+| Session registry (gateway) | Serial arithmetic with a ±2³¹ range and no ambiguity zone. A jump in [2³⁰, 2³¹) is a gap or reordering there, but ambiguous in fusion. The registry is diagnostic only, so this affects diagnostics, not data; aligning it is a small follow-up. |
+| Event store | Not affected: Sequence is not part of the identity. |
+| Reference simulator | Derives EventID as `vehicle << 32 \| sequence`, so after a wrap its EventIDs repeat within a boot and the store classifies them as conflicts. End-to-end wrap needs a producer whose EventIDs stay unique per boot (as the tests use). Reaching a wrap takes about 45 years at 3 samples per second. |
 
-**Disagreement.** The registry follows the domain contract; the fusion
-engine is stricter than it. After a wrap, the pipeline would store and track
-events that fusion rejects. The rejections are reported, not silent.
-
-**Practical impact.** At 3 samples per second, a boot reaches 2³² samples
-after about 45 years. The disagreement matters for conformance and for
-adversarial input (a device can send a sequence near 2³²−1), not for normal
-operation.
-
-**Options (not implemented):**
-
-1. Declare in the domain and protocol documentation that a device must start
-   a new boot (new BootID) before exhausting the sequence space. Fusion is
-   then already correct, and the registry's wrap support becomes tolerance.
-2. Extend fusion to serial arithmetic within one boot. Its reorder buffer
-   would need to compare by serial distance instead of `<`.
-
-Option 1 needs no code change, but it changes a Task 001 contract and needs
-review. It is recommended for decision before the two subsystems are
-connected. Until then both behaviours stay as they are.
+The option rejected was declaring that a device must reboot before
+exhausting the sequence space. It would have changed a Task 001 contract;
+extending the comparison internally keeps the contract and needs no change
+on devices.
 
 ## 3. Session chronology
 
@@ -137,17 +125,21 @@ connected. Until then both behaviours stay as they are.
 | Concurrency | One writer goroutine | One goroutine per engine, sharded by DeviceID | A consumer can read the store and dispatch by DeviceID. |
 | Malformed input | Rejected before storage, counted by reason | Re-validates; invalid → `rejected` / `invalid_sample` | Stored events always pass fusion validation. |
 
-## 5. What connecting them would take (not implemented)
+## 5. How Task 004 connects them
 
-Task 004 or later; listed so it can be scoped, not designed here:
+| Need | Implementation |
+|------|----------------|
+| Read stored events in a fixed, reproducible order, each once | `fleet-processor` pages `Store.ReadAfter` by position. Every event it feeds to fusion is a journal step (`UNIQUE(position)`). |
+| Chronological delivery | `chrono.Orderer`: sequence order within a session, device time between a device's sessions (ingestion order when device time is not evidence), ingestion order between devices (processing.md §2). |
+| `Tick(now)` in live operation | Every `TickInterval`, journaled so replays tick at the same points. |
+| Recovery | Verified replay of the journal (ticks included), then continuation from the low watermark (processing.md §3). |
+| Persisted reports, estimates and diagnostics | `results.db` (`internal/resultstore`). |
+| Sequence wrap | §2. |
 
-1. A consumer that pages `Store.ReadAfter` in position order, persists its
-   last position, shards by DeviceID into `fusion.Engine`s, and ticks them
-   with the processing clock.
-2. Recovery: on start, either replay from position 0 without ticks (exact,
-   per fusion.md §11.4) or from a persisted checkpoint (would need fusion
-   snapshots, deliberately not offered today).
-3. A decision on sequence wrap (§2) and, eventually, a shared session
-   model (§3).
-4. Persisting fusion reports and estimates, which is currently the caller's
-   job.
+Still open:
+
+- reconciliation of `requires_reconciliation` events;
+- sharding devices across several processors;
+- a shared session model (§3), and aligning the gateway registry's serial
+  range (§2);
+- journal retention or snapshots, to bound recovery time.

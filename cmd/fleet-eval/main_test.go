@@ -19,3 +19,23 @@ func TestEvalPrintsTable(t *testing.T) {
 		t.Fatalf("bad seeds: exit %d", code)
 	}
 }
+
+// -h and -help print usage and succeed, like the other FleetCore commands;
+// unknown flags and stray arguments remain usage errors.
+func TestEvalHelpAndUsageErrors(t *testing.T) {
+	for _, args := range [][]string{{"-h"}, {"-help"}} {
+		var out, errOut bytes.Buffer
+		if code := run(args, &out, &errOut); code != 0 {
+			t.Fatalf("%v: exit %d, want 0", args, code)
+		}
+		if !strings.Contains(errOut.String(), "usage: fleet-eval") || out.Len() != 0 {
+			t.Fatalf("%v: stdout %q stderr %q", args, out.String(), errOut.String())
+		}
+	}
+	for _, args := range [][]string{{"-nope"}, {"extra"}} {
+		var out, errOut bytes.Buffer
+		if code := run(args, &out, &errOut); code != 2 {
+			t.Fatalf("%v: exit %d, want 2", args, code)
+		}
+	}
+}

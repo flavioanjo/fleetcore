@@ -154,8 +154,8 @@ func (e *estimator) gap(g seqRange) []Estimate {
 	e.cal.resetSpan()
 	e.resetHealth()
 	e.pending = append(e.pending, diag(CodeSequenceGap, LevelWarning,
-		fmt.Sprintf("sequence %d-%d never received; delta-source spans are ambiguous until re-anchored", g.from, g.to)).
-		withSeq(g.from).withValue(int64(g.to-g.from)+1))
+		fmt.Sprintf("sequence %d-%d never received; delta-source spans are ambiguous until re-anchored", g.fromSeq(), g.toSeq())).
+		withSeq(g.fromSeq()).withValue(g.count()))
 	return out
 }
 
