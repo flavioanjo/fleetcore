@@ -240,7 +240,7 @@ deduplicated. ACKs are planned for a later protocol version.
 
 ## Event store
 
-See ADR-9 in [architecture.md](architecture.md) for the driver choice.
+See ADR-13 in [architecture.md](architecture.md) for the driver choice.
 
 ### Schema (version 1)
 
@@ -404,7 +404,47 @@ it is **not** authentication. Run the gateway only on trusted networks.
 | Log injection | DeviceIDs are validated before logging. Logs are structured (JSON by default) and escape all values. |
 | Tampering with stored rows | Rows are immutable (trigger), and reads verify the SHA-256 against the packet. This detects accidental corruption, not a party with write access to the file. |
 | Database file exposure | The file is created with the process's default permissions (umask). It holds device identifiers and distances; restrict the directory as needed. |
-| Dependencies | `modernc.org/sqlite` v1.38.2 and its `modernc.org/*` and `golang.org/x/sys` dependencies, pinned by `go.sum`. `govulncheck` (v1.1.4) finds no vulnerability reachable from FleetCore code. It does list GO-2026-5024 in the indirect `golang.org/x/sys` v0.34.0, which FleetCore never calls. The fix, v0.44.0, requires Go 1.25, so upgrading means raising the module's minimum Go version: a separate, repository-wide decision. |
+| Dependencies | `modernc.org/sqlite` v1.38.2 and its `modernc.org/*` and `golang.org/x/sys` dependencies, pinned by `go.sum`. No vulnerability is reachable; GO-2026-5024 is analysed below. |
+
+### Dependency advisory GO-2026-5024 (CVE-2026-39824)
+
+**Advisory.** `golang.org/x/sys/windows.NewNTUnicodeString` does not check
+for length overflow. A string longer than an `NTUnicodeString` can hold
+(a 16-bit byte count) is silently truncated instead of returning an error.
+It affects `golang.org/x/sys` < v0.44.0, on Windows only.
+
+**Investigation** (2026-11-22, `go mod graph`, `go list -m all`,
+`go list -deps`, `go tool nm`, govulncheck v1.10.0 in source mode for
+`GOOS=linux` and `GOOS=windows` and in binary mode on the Windows build):
+
+| Question | Finding |
+|----------|---------|
+| Which dependency selects the vulnerable version? | `modernc.org/sqlite@v1.38.2` requires `golang.org/x/sys@v0.34.0`; minimal version selection picks it. Other requirements (`modernc.org/libc` v0.33.0, `modernc.org/memory` v0.31.0, `mattn/go-isatty` v0.6.0) are lower. |
+| Is the vulnerable package compiled in? | **Windows: yes.** `golang.org/x/sys/windows` is imported by `modernc.org/libc` and `modernc.org/memory`, so it is part of `fleet-gateway.exe` (75 of its symbols are linked). **Linux: no**; only `golang.org/x/sys/unix` is used. `fleet-sim`, `fleet-fusion` and `fleet-eval` contain no `x/sys` code on any platform. |
+| Is the affected function reachable? | **No.** govulncheck reports no symbol-level finding on either platform (Windows: package level; Linux: module level only). `NewNTUnicodeString` is not present in the linked Windows binary: the linker dropped it as unreachable. |
+| Is there a compatible patched version? | No. The fix is in v0.44.0 only, and no earlier release is patched. |
+| Does updating require a newer Go? | **Yes.** `golang.org/x/sys` v0.44.0 declares `go 1.25.0`, so upgrading would raise this module's minimum from Go 1.23 to Go 1.25. The latest release that keeps `go 1.23.0` is v0.35.0, which is still vulnerable. |
+
+**Decision.** No upgrade. The minimum Go version is not raised
+automatically, and no security check was suppressed.
+
+**Residual risk: low.**
+
+- Exposure needs a future change, in FleetCore or in an upgraded `modernc`
+  release, that calls `NewNTUnicodeString` on Windows with a string over
+  about 32 K UTF-16 units.
+- The consequence would be silent truncation of that string, not memory
+  corruption.
+- No input from the network reaches Windows API string conversion in the
+  gateway.
+
+**Follow-up.**
+
+- Upgrade `golang.org/x/sys` to ≥ v0.44.0 when the project decides to require
+  Go ≥ 1.25.
+- Re-run govulncheck after every dependency change. govulncheck v1.1.4
+  crashes when analysing `GOOS=linux` with go1.27, so use v1.10.0 or later.
+
 
 ## Benchmark results
 

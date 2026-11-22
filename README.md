@@ -3,10 +3,13 @@
 FleetCore is a fleet telemetry simulation platform written in Go. It models
 how connected vehicles report distance travelled from several imperfect
 sensors, defines an original binary protocol for transporting those
-measurements, and generates realistic but entirely synthetic telemetry.
+measurements, generates realistic but entirely synthetic telemetry, and
+fuses the sensors into one explainable distance estimate.
 
-> **Status:** v0.1.0 foundation (domain model, wire protocol, simulator)
-> plus the event ingestion pipeline (UDP gateway, session registry, event store).
+> **Status:** v0.2.0. Domain model, wire protocol, simulator and telemetry
+> fusion engine, plus the event ingestion pipeline (UDP gateway, session
+> registry, event store). The ingestion pipeline and the fusion engine are
+> not connected yet; see [docs/integration.md](docs/integration.md).
 
 ## Why it exists
 
@@ -23,7 +26,7 @@ The project is inspired by common problems in fleet telemetry, distributed
 systems and IoT infrastructure. All code, protocols and data are original;
 all device identifiers and telemetry are synthetic.
 
-## Features in v0.1.0
+## Features
 
 - **Telemetry domain** (`internal/telemetry`)
   - Strongly typed samples: device, event, boot/session and sequence
@@ -45,6 +48,25 @@ all device identifiers and telemetry are synthetic.
     and dropouts, a 100 m-resolution CAN odometer, and a pulse counter with a
     per-vehicle calibration error.
   - Fully reproducible from a seed, on every platform; JSON Lines output.
+  - Ground truth available only through an explicit testing API
+    (`simulator.RunWithGroundTruth`).
+- **Telemetry fusion engine** (`internal/fusion`, `cmd/fleet-fusion`, [design](docs/fusion.md))
+  - Per-device distance estimation from GPS deltas, the 100 m CAN odometer
+    and the pulse counter: inverse-variance fusion and CAN interval
+    reconciliation.
+  - Conservative pulse calibration (≥ 20 km CAN or GPS reference) and source
+    health checks.
+  - Explicit handling of missing measurements, including interpolation of
+    short uncovered spans.
+  - Bounded reordering by sequence number. Duplicates, conflicts, gaps,
+    late events, reboots, stale sessions and clock problems each have a
+    defined, reported outcome.
+  - Structured, machine-readable diagnostics and uncertainty for every
+    estimate.
+  - Deterministic, integer arithmetic, finite memory (~5 KB per device).
+- **Evaluation harness** (`internal/evaluation`, `cmd/fleet-eval`)
+  - Compares fusion with simulator ground truth and simple baselines,
+    across source combinations, seeds and delivery perturbations.
 
 ## Event ingestion
 
@@ -109,6 +131,33 @@ Flags:
 Samples are ordered by round, then by vehicle, then by source. A missing
 measurement has `"quality":"unavailable"` and `"distance":null`.
 
+### Fuse telemetry
+
+```bash
+# Simulate, fuse, and print one summary line per vehicle
+go run ./cmd/fleet-sim -vehicles 2 -samples 360 -interval 10s \
+  | go run ./cmd/fleet-fusion -events none -summary
+
+# Keep everything: every event disposition and every estimate
+go run ./cmd/fleet-fusion -in samples.jsonl -events all > reports.jsonl
+```
+
+`fleet-fusion` writes JSON Lines with a `type` of `event`, `estimate`,
+`input_error` (an undecodable line: reported, never dropped; the exit
+status is then 1) or `summary`. Flags: `-in`, `-events all|issues|none`,
+`-summary`, `-strict`, `-window`, `-max-buffer`. The output format is
+described in [docs/fusion.md](docs/fusion.md#6-output).
+
+### Evaluate accuracy
+
+```bash
+go run ./cmd/fleet-eval -seeds 1,2,3,4,5 -perturb
+```
+
+This prints, for every source combination, the fused error against ground
+truth next to the naive and CAN-difference baselines. Current results are
+in [docs/fusion.md §8](docs/fusion.md#8-accuracy-evaluation).
+
 ## Tests
 
 ```bash
@@ -122,10 +171,20 @@ go test -run='^$' -fuzz=FuzzObserve -fuzztime=60s ./internal/sessions
 
 # Regenerate the simulator golden file after an intentional model change
 go test ./internal/simulator -run Golden -update
+
+# Fusion throughput and memory benchmarks
+go test -run '^$' -bench . ./internal/fusion
+
+# Skip the 24-hour simulation test
+go test -short ./...
 ```
 
-CI (`.github/workflows/ci.yml`) runs formatting, vet, build, tests, the race
-detector, a short fuzz session and a reproducibility smoke test.
+CI (`.github/workflows/ci.yml`) runs:
+
+- formatting, vet, build and tests;
+- the race detector and a short fuzz session;
+- a reproducibility smoke test;
+- the accuracy evaluation, as part of the tests.
 
 ## Repository structure
 
@@ -133,17 +192,23 @@ detector, a short fuzz session and a reproducibility smoke test.
 fleetcore/
 ├── cmd/
 │   ├── fleet-sim/          CLI: synthetic telemetry as JSON Lines
+│   ├── fleet-fusion/       CLI: fuse JSON Lines telemetry into estimates
+│   ├── fleet-eval/         CLI: accuracy evaluation table
 │   └── fleet-gateway/      UDP ingestion gateway with SQLite storage
 ├── internal/
 │   ├── telemetry/          domain model and validation
 │   ├── protocol/           binary wire format
-│   ├── simulator/          deterministic fleet simulator (+ testdata/ golden file)
+│   ├── simulator/          deterministic fleet simulator (+ testdata/ golden file, test-only ground truth)
+│   ├── fusion/             telemetry fusion engine
+│   ├── evaluation/         accuracy harness (tooling, not production)
 │   ├── gateway/            UDP receiver, bounded pipeline, graceful shutdown
 │   ├── sessions/           device session registry and ordering diagnostics
 │   └── eventstore/         durable, deduplicated event storage (SQLite)
 ├── docs/
 │   ├── architecture.md     architectural decisions
+│   ├── fusion.md           fusion engine design and evaluation
 │   ├── ingestion.md        ingestion pipeline: identity, backpressure, storage
+│   ├── integration.md      open differences between ingestion and fusion
 │   └── protocol.md         wire format specification
 ├── .github/workflows/ci.yml
 ├── COPYRIGHT
@@ -152,21 +217,25 @@ fleetcore/
 
 ## Roadmap
 
+Done:
+
+- ~~Telemetry Fusion Engine~~ ([docs/fusion.md](docs/fusion.md)).
+- ~~UDP Gateway~~, ~~Device Session Registry~~ and ~~Persistent Event
+  Store~~ ([docs/ingestion.md](docs/ingestion.md)).
+
 Planned, not implemented. See [docs/architecture.md](docs/architecture.md)
 for where each piece is expected to fit.
 
-1. **Telemetry Fusion Engine:** reconcile GPS, CAN and pulse distances into
-   one trustworthy odometer.
-2. **UDP Gateway:** receive protocol packets and stamp ingestion time.
-   *Implemented ([docs/ingestion.md](docs/ingestion.md)).*
-3. **Device Session Registry:** track boots and detect sequence gaps, replays
-   and reordering. *Implemented.*
-4. **Persistent Event Store:** durable, deduplicated storage by event ID.
-   *Implemented (SQLite).*
-5. **Diagnostics and Observability:** metrics and structured logs.
-6. **Command Dispatcher** and **Firmware Transfer Service:** downlink
+1. **Ingestion → fusion integration:** feed stored events to the fusion
+   engine, with replay-based fusion recovery and reconciliation of late
+   events. The open design questions are listed in
+   [docs/integration.md](docs/integration.md).
+2. **Shared session tracking:** one session model for ingestion and fusion.
+3. **Diagnostics and Observability:** metrics and structured logs, fed by
+   fusion and ingestion diagnostics.
+4. **Command Dispatcher** and **Firmware Transfer Service:** downlink
    messages (protocol v2).
-7. **Event Replicator:** replicate stored events to other consumers.
+5. **Event Replicator:** replicate stored events to other consumers.
 
 ## Copyright
 
