@@ -12,10 +12,10 @@ interruption. The final state is summarised at the end.
 |---|-----------|--------|
 | 1 | `internal/security`: HKDF (RFC 5869), per-purpose session keys, key store with rotation states, Ed25519 command authority, replay window | done |
 | 2 | `internal/reliable`: protocol v2 codec (frames, events, ACKs, commands), fail-closed decoding, golden + fuzz tests | done |
-| 3 | `internal/eventstore` migration 2: reliable events, conflicts, device sessions; `AppendReliable` | pending |
-| 4 | `internal/commandstore`: durable command lifecycle, authorization, transitions, audit history | pending |
-| 5 | Gateway reliable v2 path (`internal/gateway/reliable*.go`): authenticate, persist, ACK after commit, downlink transport | pending |
-| 6 | `internal/device`: durable outbox, retries, priority, command execution with simulated hardware | pending |
+| 3 | `internal/eventstore` migration 2: reliable events, conflicts, device sessions; `AppendReliable` | done |
+| 4 | `internal/commandstore`: durable command lifecycle, authorization, transitions, audit history | done |
+| 5 | Gateway reliable v2 path (`internal/gateway/reliable*.go`): authenticate, persist, ACK after commit, downlink transport | done |
+| 6 | `internal/device`: durable outbox, retries, priority, command execution with simulated hardware | done |
 | 7 | `internal/dispatcher`: dispatch loop, expiry/unknown sweeper, COMMAND_RESULT/state applier | pending |
 | 8 | `internal/alerting`: critical event consumer boundary (PANIC, security violations) | pending |
 | 9 | `internal/simnet`: deterministic network, clock, fault injection; scenario tests | pending |
@@ -47,3 +47,14 @@ interruption. The final state is summarised at the end.
   (hashlib/hmac); this caught an off-by-one in the header size (a stray zero byte between
   device id and payload, consistent on both sides so round trips passed) — fixed before commit.
   Fuzz: FuzzOpen, FuzzEventPayload, FuzzDownlink ~25 s each, no failures.
+- M3 done: eventstore schema 2 (additive). Existing migration-mechanics tests were made
+  version-relative (same assertions) because they hard-coded the test migration as v2.
+- Architecture test extended to admit internal/reliable + internal/security for ingestion, with
+  a new check that those packages import only the domain/v1 codec (commit 8ef21e2). Lesson: a
+  `grep -v ok` pipeline masked a failing exit code once (5529b03); exit codes are now checked.
+- M4 done: commandstore (lifecycle, write-ahead attempts, unknown vs expired, ranked reports).
+- M5 done: gateway v2 path. A test exposed a cross-gateway stale-session window when the
+  session was cached for 5 s; fixed by reading the durable session high-water mark per batch.
+- M6 done: device (outbox, priority + anti-starvation, backoff+jitter, commands with
+  write-ahead execution, boot recovery), simulated hardware in internal/simhw. Found and fixed:
+  NULL args for argument-less commands violated a NOT NULL constraint.

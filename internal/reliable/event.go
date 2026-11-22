@@ -593,7 +593,10 @@ type CommandResult struct {
 
 func (CommandResult) EventType() EventType { return EventCommandResult }
 func (c CommandResult) check() error {
-	if c.CommandID.IsZero() || !c.CommandType.Valid() || !c.Stage.valid() || !c.Reason.valid() {
+	// The command type is echoed as received: a device reports a type it
+	// does not implement (ReasonUnsupported) with that type's code, so any
+	// non-zero code is valid here.
+	if c.CommandID.IsZero() || c.CommandType == 0 || !c.Stage.valid() || !c.Reason.valid() {
 		return errf(CodeInvalidEvent, "command result for %s stage %d reason %d", c.CommandType, c.Stage, c.Reason)
 	}
 	if c.Observed > 3 {

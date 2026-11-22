@@ -110,7 +110,7 @@ func TestInvalidBodiesRejected(t *testing.T) {
 		BlockState{State: 9, Cause: CauseBoot},
 		CargoState{Door: DoorOpen, Latch: LatchLocked, Cause: CauseBoot, CommandID: CommandID{1}}, // id without command cause
 		CommandResult{CommandType: CommandBlock, Stage: StageReceived},                            // zero id
-		CommandResult{CommandID: CommandID{1}, CommandType: 9, Stage: StageReceived},
+		CommandResult{CommandID: CommandID{1}, CommandType: 0, Stage: StageReceived},
 		CommandResult{CommandID: CommandID{1}, CommandType: CommandBlock, Stage: 0},
 		SecurityViolation{Code: 0},
 		Diagnostic{},
