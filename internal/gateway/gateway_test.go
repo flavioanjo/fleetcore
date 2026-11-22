@@ -228,6 +228,13 @@ type memStore struct {
 
 func newMemStore() *memStore { return &memStore{stored: map[eventstore.Key]eventstore.Fingerprint{}} }
 
+// eventCount returns the number of events passed to AppendBatch.
+func (m *memStore) eventCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.events
+}
+
 func (m *memStore) AppendBatch(ctx context.Context, evs []eventstore.Event) ([]eventstore.Result, error) {
 	if m.block != nil {
 		select {
@@ -319,8 +326,8 @@ func TestGracefulShutdownDrainsQueues(t *testing.T) {
 	if err := <-stopped; err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if st := r.g.Stats(); st.Inserted != n || store.events != n {
-		t.Fatalf("after shutdown: %+v, store saw %d", st, store.events)
+	if st := r.g.Stats(); st.Inserted != n || store.eventCount() != n {
+		t.Fatalf("after shutdown: %+v, store saw %d", st, store.eventCount())
 	}
 }
 
@@ -380,8 +387,8 @@ func TestDedupCacheShortCircuitsRetransmissions(t *testing.T) {
 	if st.Duplicates != 2 || st.DuplicatesCached != 2 {
 		t.Fatalf("stats %+v", st)
 	}
-	if store.events != 1 {
-		t.Fatalf("store saw %d events; retransmissions were not answered from the cache", store.events)
+	if store.eventCount() != 1 {
+		t.Fatalf("store saw %d events; retransmissions were not answered from the cache", store.eventCount())
 	}
 
 	// A conflicting payload for a cached identity still reaches the store.

@@ -473,7 +473,8 @@ func (g *Gateway) flush(writeCtx context.Context, batch []item) {
 		s := it.ev.Sample
 		switch res.Outcome {
 		case eventstore.Inserted:
-			g.stats.inserted.Add(1)
+			// The outcome counter is published last, so a caller that sees
+			// the pipeline settled also sees this event's diagnostics.
 			g.cache.add(it.ev.Key(), it.ev.Fingerprint)
 			if len(res.EventIDAlsoInBoots) > 0 {
 				g.stats.eventIDReused.Add(1)
@@ -488,6 +489,7 @@ func (g *Gateway) flush(writeCtx context.Context, batch []item) {
 				}
 			}
 			g.observe(s)
+			g.stats.inserted.Add(1)
 		case eventstore.Duplicate:
 			g.stats.duplicates.Add(1)
 			g.cache.add(it.ev.Key(), it.ev.Fingerprint)
