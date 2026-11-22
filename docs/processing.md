@@ -172,12 +172,19 @@ stored events alone. The processor therefore **records its decisions**.
   (`ErrWrongEventStore`).
 - **Cursor.**
   - `low_position`: every position at or below it is journaled.
-  - `high_position`: the last position read.
+  - `high_position`: the highest position ever read (it never decreases).
 
   Events read but still held when the process stopped are not in the
-  journal. After a restart they are read again from `low_position`, skipping
-  journaled positions, so nothing is lost or repeated.
-  `TestRestartReplaysAndContinuesWithoutLossOrRepeat` checks this.
+  journal, so `low_position < high_position` and positions in
+  `(low_position, high_position]` may or may not be journaled. After a
+  restart the read cursor starts at `low_position`, not at `high_position`:
+  positions already journaled are skipped (their effect is in the replayed
+  state), the others are held again for a full hold window, so nothing is
+  lost or repeated. While the re-read is catching up, `low_position` never
+  passes the read cursor. `TestRestartReplaysAndContinuesWithoutLossOrRepeat`
+  and the tests in `internal/processor/recovery_test.go` (held events with
+  no new input, interleaved journaled and held positions, repeated
+  restarts, crash before and after a commit, fencing) check this.
 - **No `Flush`.** The processor never flushes the engine: an open epoch
   stays open across a restart, exactly as without one.
 

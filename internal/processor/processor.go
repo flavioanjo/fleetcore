@@ -15,9 +15,13 @@
 // the state the live engine had. Then processing continues.
 //
 // Events that were read but not yet released when the process stopped are
-// not in the journal. They are read again from the event store (the cursor
-// restarts at the low watermark, skipping journaled positions), so no stored
-// event is lost or processed twice.
+// not in the journal. The durable cursor then has low_position <
+// high_position: every position at or below low is journaled, positions in
+// (low, high] may or may not be. After a restart the read cursor starts at
+// the low watermark, not at high; positions in (low, high] that are already
+// journaled are skipped (they were replayed), the others are held again, so
+// no stored event is lost or given to fusion twice. A re-read event is held
+// for a full Config.Chrono.Hold from the time it is read again.
 //
 // The processor never calls Engine.Flush: an open epoch stays open across a
 // restart exactly as it would have without one.
@@ -131,12 +135,16 @@ type Processor struct {
 
 	recovered bool
 	nextStep  int64
-	low, high int64
-	skip      map[int64]bool // journaled positions above low, not to be re-added
-	lastTick  time.Time
-	pending   []resultstore.Step
-	stats     Stats
-	snapshot  atomic.Pointer[Stats] // published copy of stats, safe to read concurrently
+	// low: every position at or below it is journaled (durable).
+	// high: the highest position ever read (durable, never decreases).
+	// read: the last position read in this run; it restarts at low, so
+	// read <= high, and positions in (read, high] are still to be re-read.
+	low, high, read int64
+	skip            map[int64]bool // journaled positions above read, not to be re-added
+	lastTick        time.Time
+	pending         []resultstore.Step
+	stats           Stats
+	snapshot        atomic.Pointer[Stats] // published copy of stats, safe to read concurrently
 }
 
 // New returns a processor reading from events and writing to results.
@@ -194,6 +202,9 @@ func (p *Processor) Recover(ctx context.Context) (RecoveryStats, error) {
 		return rs, fmt.Errorf("processor: journal ends at step %d but state expects next step %d", after, st.NextStep)
 	}
 	p.nextStep, p.low, p.high = st.NextStep, st.LowPosition, st.HighPosition
+	// Positions in (low, high] were read before the restart, but only the
+	// journaled ones are in the replayed state: read again from low.
+	p.read = p.low
 	if p.skip, err = p.results.JournaledPositionsAbove(ctx, p.low); err != nil {
 		return rs, err
 	}
@@ -274,12 +285,15 @@ func (p *Processor) Step(ctx context.Context) (int, error) {
 		return 0, errors.New("processor: Step before Recover")
 	}
 	now := p.cfg.Now().UTC()
-	recs, err := p.events.ReadAfter(ctx, p.high, p.cfg.ReadBatch)
+	recs, err := p.events.ReadAfter(ctx, p.read, p.cfg.ReadBatch)
 	if err != nil {
 		return 0, err // nothing changed yet; the caller may retry
 	}
 	for _, r := range recs {
-		p.high = r.Position
+		p.read = r.Position
+		if r.Position > p.high {
+			p.high = r.Position
+		}
 		if p.skip[r.Position] {
 			delete(p.skip, r.Position)
 			continue
@@ -345,7 +359,11 @@ func (p *Processor) add(e resultstore.Entry, reports []fusion.Report) error {
 // processed them, so a commit that keeps failing is fatal: the in-memory
 // state is then ahead of the journal and only a restart (replay) recovers.
 func (p *Processor) commit(ctx context.Context) (int, error) {
-	low := p.high
+	// Everything read in this run and not held is journaled (released, or
+	// skipped as already journaled). Positions above read are not known to
+	// be, even when they are at or below high (not yet re-read after a
+	// restart), so low never passes read.
+	low := p.read
 	if m, ok := p.order.MinHeldPosition(); ok {
 		low = m - 1
 	}
