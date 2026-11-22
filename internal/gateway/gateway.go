@@ -50,6 +50,7 @@ import (
 
 	"github.com/flavioanjo/fleetcore/internal/eventstore"
 	"github.com/flavioanjo/fleetcore/internal/protocol"
+	"github.com/flavioanjo/fleetcore/internal/reliable"
 	"github.com/flavioanjo/fleetcore/internal/sessions"
 	"github.com/flavioanjo/fleetcore/internal/telemetry"
 )
@@ -113,6 +114,11 @@ type Config struct {
 	Now func() time.Time
 	// Logger receives structured logs. Default slog.Default().
 	Logger *slog.Logger
+	// Reliable enables protocol v2 (authenticated, acknowledged delivery and
+	// command transport; see reliable.go). Nil keeps the gateway v1-only:
+	// v2 datagrams are then rejected as an unsupported version, exactly as
+	// before.
+	Reliable *ReliableConfig
 }
 
 func (c Config) withDefaults() (Config, error) {
@@ -181,6 +187,9 @@ type Gateway struct {
 	queue  chan datagram
 	storeQ chan item
 
+	rel  *Reliable
+	relQ chan Prepared
+
 	runOnce sync.Once
 }
 
@@ -219,7 +228,16 @@ func New(cfg Config, store Appender, reg Observer) (*Gateway, error) {
 			return nil, fmt.Errorf("gateway: set read buffer: %w", err)
 		}
 	}
+	var rel *Reliable
+	if cfg.Reliable != nil {
+		if rel, err = NewReliable(*cfg.Reliable, cfg.Now, cfg.Logger); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
 	return &Gateway{
+		rel:        rel,
+		relQ:       make(chan Prepared, cfg.StoreQueueSize),
 		cfg:        cfg,
 		conn:       conn,
 		store:      store,
@@ -278,9 +296,15 @@ func (g *Gateway) run(ctx context.Context) error {
 		defer close(writerDone)
 		g.writeLoop(writeCtx)
 	}()
+	relDone := make(chan struct{})
+	go func() {
+		defer close(relDone)
+		g.reliableLoop(writeCtx)
+	}()
 	go func() {
 		workers.Wait()
 		close(g.storeQ)
+		close(g.relQ)
 	}()
 
 	var readErr error
@@ -298,6 +322,7 @@ func (g *Gateway) run(ctx context.Context) error {
 		cancelWrite()
 	})
 	<-writerDone
+	<-relDone
 	drain.Stop()
 
 	st := g.Stats()
@@ -355,6 +380,17 @@ func (g *Gateway) readLoop() error {
 
 func (g *Gateway) decodeLoop(writeCtx context.Context) {
 	for d := range g.queue {
+		if g.rel != nil && reliable.IsVersion2(d.data) {
+			// Authentication (HMAC) runs here, in parallel; the stateful
+			// checks and the store run in the reliable loop.
+			p := g.rel.Prepare(Inbound{Data: d.data, From: d.from, At: d.at})
+			select {
+			case g.relQ <- p:
+			case <-writeCtx.Done():
+				g.stats.shutdownDropped.Add(1)
+			}
+			continue
+		}
 		s, err := protocol.DecodeSample(d.data)
 		if err != nil {
 			var pe *protocol.Error
