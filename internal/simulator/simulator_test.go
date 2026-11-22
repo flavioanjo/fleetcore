@@ -137,6 +137,47 @@ func TestVehiclesAreIndependent(t *testing.T) {
 	}
 }
 
+func TestGroundTruthDoesNotChangeSamples(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Vehicles, cfg.Samples = 4, 300
+	plain := collect(t, cfg)
+	var withTruth []telemetry.Sample
+	var truths []Truth
+	err := RunWithGroundTruth(cfg,
+		func(s telemetry.Sample) error { withTruth = append(withTruth, s); return nil },
+		func(tr Truth) { truths = append(truths, tr) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(plain, withTruth) {
+		t.Fatal("observing ground truth changed the emitted samples")
+	}
+	if len(truths) != cfg.Vehicles*cfg.Samples {
+		t.Fatalf("got %d truth records, want %d", len(truths), cfg.Vehicles*cfg.Samples)
+	}
+	// Truth must agree with the CAN odometer (which floors to 100 m) and be
+	// internally consistent.
+	odo := map[telemetry.DeviceID]telemetry.Millimetres{}
+	for _, tr := range truths {
+		if prev, ok := odo[tr.DeviceID]; ok && tr.OdometerMM != prev+tr.DistanceMM {
+			t.Fatalf("%s round %d: odometer %d != %d + %d", tr.DeviceID, tr.Round, tr.OdometerMM, prev, tr.DistanceMM)
+		}
+		odo[tr.DeviceID] = tr.OdometerMM
+	}
+	i := 0
+	for _, s := range plain {
+		if s.Source != telemetry.SourceCAN {
+			continue
+		}
+		for truths[i].DeviceID != s.DeviceID || !truths[i].DeviceTime.Equal(s.DeviceTime) {
+			i++
+		}
+		if d, ok := s.Distance.Get(); ok && d.Value != truths[i].OdometerMM/canResolution*canResolution {
+			t.Fatalf("CAN %d does not match quantised truth %d", d.Value, truths[i].OdometerMM)
+		}
+	}
+}
+
 func TestAddingVehiclesKeepsExistingStreams(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Vehicles, cfg.Samples = 2, 30
