@@ -1,20 +1,6 @@
 package eventstore
 
-import (
-	"context"
-	"database/sql"
-	"fmt"
-	"time"
-)
-
-// migration is one forward-only schema step. Versions are consecutive,
-// starting at 1, and an applied migration must never be edited: schema
-// changes are new migrations.
-type migration struct {
-	version int
-	name    string
-	stmts   []string
-}
+import "github.com/flavioanjo/fleetcore/internal/sqlitedb"
 
 // migrations is the complete schema history of the FleetCore event store.
 //
@@ -25,11 +11,11 @@ type migration struct {
 //     nanoseconds, which cover the domain's [2000, 2100) timestamp range.
 //   - packet is the canonical version-1 encoding and the source of truth
 //     when reading; the decoded columns exist for SQL queries and constraints.
-var migrations = []migration{
+var migrations = []sqlitedb.Migration{
 	{
-		version: 1,
-		name:    "events and conflicts",
-		stmts: []string{
+		Version: 1,
+		Name:    "events and conflicts",
+		Stmts: []string{
 			`CREATE TABLE events (
 				position       INTEGER PRIMARY KEY AUTOINCREMENT,
 				device_id      TEXT    NOT NULL CHECK (length(device_id) BETWEEN 1 AND 32),
@@ -76,49 +62,4 @@ var migrations = []migration{
 }
 
 // SchemaVersion is the schema version this build creates and understands.
-func SchemaVersion() int { return migrations[len(migrations)-1].version }
-
-// migrate brings the database to SchemaVersion inside one immediate
-// transaction, so concurrent openers serialize and a failed step leaves the
-// schema unchanged. A database written by a newer build is refused rather
-// than used with an unknown schema.
-func migrate(ctx context.Context, db *sql.DB, now time.Time) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("eventstore: migrate: begin: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // no-op after Commit
-
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version       INTEGER PRIMARY KEY,
-		name          TEXT    NOT NULL,
-		applied_at_ns INTEGER NOT NULL
-	) STRICT`); err != nil {
-		return fmt.Errorf("eventstore: migrate: %w", err)
-	}
-	var current int
-	if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(version), 0) FROM schema_migrations`).Scan(&current); err != nil {
-		return fmt.Errorf("eventstore: migrate: read version: %w", err)
-	}
-	if current > SchemaVersion() {
-		return fmt.Errorf("%w: database is at version %d, this build supports up to %d", ErrSchemaTooNew, current, SchemaVersion())
-	}
-	for _, m := range migrations {
-		if m.version <= current {
-			continue
-		}
-		for _, stmt := range m.stmts {
-			if _, err := tx.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("eventstore: migration %d (%s): %w", m.version, m.name, err)
-			}
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, name, applied_at_ns) VALUES (?, ?, ?)`,
-			m.version, m.name, now.UnixNano()); err != nil {
-			return fmt.Errorf("eventstore: migration %d: record: %w", m.version, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("eventstore: migrate: commit: %w", err)
-	}
-	return nil
-}
+func SchemaVersion() int { return migrations[len(migrations)-1].Version }

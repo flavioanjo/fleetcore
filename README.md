@@ -6,10 +6,10 @@ sensors, defines an original binary protocol for transporting those
 measurements, generates realistic but entirely synthetic telemetry, and
 fuses the sensors into one explainable distance estimate.
 
-> **Status:** v0.2.0. Domain model, wire protocol, simulator and telemetry
-> fusion engine, plus the event ingestion pipeline (UDP gateway, session
-> registry, event store). The ingestion pipeline and the fusion engine are
-> not connected yet; see [docs/integration.md](docs/integration.md).
+> **Status:** v0.3.0 (in review). Domain model, wire protocol, simulator,
+> telemetry fusion engine, event ingestion pipeline, and the end-to-end
+> chronological processor that connects them and persists the results
+> ([docs/processing.md](docs/processing.md)).
 
 ## Why it exists
 
@@ -95,12 +95,36 @@ go run ./cmd/fleet-gateway -listen 127.0.0.1:7400 -db fleetcore-events.db -log-f
 Packets carry a CRC-32C, which detects corruption but does **not**
 authenticate senders; run the gateway only on trusted networks.
 
+## End-to-end processing
+
+`cmd/fleet-processor` reads the events stored by one or more gateways,
+orders them chronologically, feeds them to the fusion engine and persists
+the journal, estimates and diagnostics in a results database. See
+[docs/processing.md](docs/processing.md).
+
+```bash
+go run ./cmd/fleet-gateway   -listen :7400 -db events.db &
+go run ./cmd/fleet-gateway   -listen :7401 -db events.db &   # a second gateway on the same store
+go run ./cmd/fleet-processor -events events.db -results results.db
+```
+
+- **Order:** within a session by sequence number, wrap-around of the 32-bit
+  sequence included. Between a device's sessions by device time, when it is
+  evidence. Otherwise, and between devices, by the central ingestion order.
+- **Deterministic recovery:** every call into the engine (events and
+  `Tick`) is journaled with its outputs. A restart replays the journal and
+  verifies every step against a stored hash before continuing.
+- **Nothing dropped:** late, duplicate and conflicting events are preserved
+  (in the event store, and as flags and fusion outcomes in the results).
+- **Current results:** `SELECT * FROM latest_estimates` in the results
+  database.
+
 ## Requirements
 
 - Go 1.23 or later.
 - One third-party dependency: the pure-Go SQLite driver `modernc.org/sqlite`
-  (used by the event store; no cgo required). Everything else uses the
-  standard library.
+  (used by the event and results stores; no cgo required). Everything else
+  uses the standard library.
 
 ## Build and run
 
@@ -168,6 +192,7 @@ go vet ./...
 # Optional: fuzz the protocol decoder and the session registry
 go test -run='^$' -fuzz=FuzzDecodeSample -fuzztime=60s ./internal/protocol
 go test -run='^$' -fuzz=FuzzObserve -fuzztime=60s ./internal/sessions
+go test -run='^$' -fuzz=FuzzOrderer -fuzztime=60s ./internal/chrono
 
 # Regenerate the simulator golden file after an intentional model change
 go test ./internal/simulator -run Golden -update
@@ -194,7 +219,8 @@ fleetcore/
 │   ├── fleet-sim/          CLI: synthetic telemetry as JSON Lines
 │   ├── fleet-fusion/       CLI: fuse JSON Lines telemetry into estimates
 │   ├── fleet-eval/         CLI: accuracy evaluation table
-│   └── fleet-gateway/      UDP ingestion gateway with SQLite storage
+│   ├── fleet-gateway/      UDP ingestion gateway with SQLite storage
+│   └── fleet-processor/    chronological processor: store → fusion → results
 ├── internal/
 │   ├── telemetry/          domain model and validation
 │   ├── protocol/           binary wire format
@@ -203,12 +229,17 @@ fleetcore/
 │   ├── evaluation/         accuracy harness (tooling, not production)
 │   ├── gateway/            UDP receiver, bounded pipeline, graceful shutdown
 │   ├── sessions/           device session registry and ordering diagnostics
-│   └── eventstore/         durable, deduplicated event storage (SQLite)
+│   ├── eventstore/         durable, deduplicated event storage (SQLite)
+│   ├── sqlitedb/           shared SQLite configuration and migrations
+│   ├── chrono/             deterministic chronological orderer
+│   ├── resultstore/        processing journal, estimates and diagnostics (SQLite)
+│   └── processor/          event store → orderer → fusion → results
 ├── docs/
 │   ├── architecture.md     architectural decisions
 │   ├── fusion.md           fusion engine design and evaluation
 │   ├── ingestion.md        ingestion pipeline: identity, backpressure, storage
-│   ├── integration.md      open differences between ingestion and fusion
+│   ├── integration.md      differences between ingestion and fusion
+│   ├── processing.md       end-to-end processing: chronology, journal, recovery
 │   └── protocol.md         wire format specification
 ├── .github/workflows/ci.yml
 ├── COPYRIGHT
@@ -222,14 +253,14 @@ Done:
 - ~~Telemetry Fusion Engine~~ ([docs/fusion.md](docs/fusion.md)).
 - ~~UDP Gateway~~, ~~Device Session Registry~~ and ~~Persistent Event
   Store~~ ([docs/ingestion.md](docs/ingestion.md)).
+- ~~End-to-end integration and event chronology~~
+  ([docs/processing.md](docs/processing.md)).
 
 Planned, not implemented. See [docs/architecture.md](docs/architecture.md)
 for where each piece is expected to fit.
 
-1. **Ingestion → fusion integration:** feed stored events to the fusion
-   engine, with replay-based fusion recovery and reconciliation of late
-   events. The open design questions are listed in
-   [docs/integration.md](docs/integration.md).
+1. **Reconciliation** of events fusion reports as `requires_reconciliation`,
+   and bounded recovery time (journal retention or snapshots).
 2. **Shared session tracking:** one session model for ingestion and fusion.
 3. **Diagnostics and Observability:** metrics and structured logs, fed by
    fusion and ingestion diagnostics.

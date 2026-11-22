@@ -4,7 +4,7 @@ This document records the architectural decisions behind FleetCore. Each
 decision lists the context, the choice and its consequences, so later
 changes can revisit them deliberately.
 
-## Overview (v0.2.0)
+## Overview (v0.3.0)
 
 ```
 cmd/fleet-sim ─────► internal/simulator ──────────────┐
@@ -13,12 +13,17 @@ cmd/fleet-eval ────► internal/evaluation ─┬► fusion   │
                                           └► simulator├──► internal/telemetry
                      internal/protocol ───────────────┤
                            ▲                          │
-cmd/fleet-gateway ─► internal/gateway ─┬► internal/eventstore (SQLite)
-                                       └► internal/sessions
+cmd/fleet-gateway ─► internal/gateway ─┬► internal/eventstore (SQLite) ◄─┐
+                                       └► internal/sessions              │
+cmd/fleet-processor ─► internal/processor ─┬► internal/chrono            │
+                                           ├► internal/fusion            │
+                                           ├► internal/resultstore (SQLite)
+                                           └► internal/eventstore ───────┘
 ```
 
 The event store and the gateway also use `internal/protocol`; the session
-registry uses only `internal/telemetry`.
+registry uses only `internal/telemetry`. Both SQLite stores share
+`internal/sqlitedb`.
 
 | Package               | Responsibility | Depends on |
 |-----------------------|----------------|------------|
@@ -33,7 +38,12 @@ registry uses only `internal/telemetry`.
 | `cmd/fleet-sim`       | CLI: simulator output as JSON Lines. | simulator, telemetry |
 | `cmd/fleet-fusion`    | CLI: JSON Lines samples in, fusion reports out. | fusion, telemetry |
 | `cmd/fleet-eval`      | CLI: prints the accuracy table. | evaluation |
+| `internal/sqlitedb`   | SQLite configuration (WAL, FULL sync, single writer) and versioned migrations, shared by both stores. | `modernc.org/sqlite` |
+| `internal/chrono`     | Deterministic chronological orderer: hybrid order, extended sequence numbers, holding, flags. | telemetry |
+| `internal/resultstore`| Results database: processing journal, fusion reports, estimates, diagnostics. | chrono, fusion, sqlitedb, telemetry |
+| `internal/processor`  | Event store → orderer → fusion → results, with verified journal replay. | chrono, eventstore, fusion, resultstore |
 | `cmd/fleet-gateway`   | Executable running the ingestion pipeline. | gateway, eventstore, sessions |
+| `cmd/fleet-processor` | Executable running the chronological processor. | processor, eventstore, resultstore, chrono |
 
 `telemetry` is the core of the dependency graph and depends on nothing else
 in the repository. `fusion` depends only on `telemetry`. A test
@@ -43,12 +53,14 @@ and the fusion engine are independent of each other; they meet only in
 tests, in the evaluation harness, and later in services that compose them.
 
 The ingestion pipeline (`gateway`, `eventstore`, `sessions`) and `fusion` do
-not import each other. The two subsystems are not connected yet: nothing
-feeds stored events to the fusion engine.
+not import each other (`TestIngestionIsDecoupledFromFusion`). They are
+connected only by `internal/processor`, which reads the event store and
+drives the engine.
 
 The fusion design is documented in [fusion.md](fusion.md), the ingestion
-pipeline in [ingestion.md](ingestion.md), and the open differences between
-them in [integration.md](integration.md).
+pipeline in [ingestion.md](ingestion.md), the end-to-end processing in
+[processing.md](processing.md), and the remaining differences between the
+subsystems in [integration.md](integration.md).
 
 ## ADR-1: One modular repository, one deployable unit (for now)
 
@@ -268,6 +280,103 @@ local storage without an external server. Go's standard library has
 indirect) and slower raw throughput than the C build, which is acceptable at
 gateway batch sizes. Storage access stays behind the gateway's small
 `Appender` interface, so the engine can be replaced.
+
+## ADR-14: Hybrid chronology for the processing stream
+
+**Context.** The processor must deliver stored events to fusion in a
+chronological, deterministic order. Two rules conflict:
+
+- "order by device time" is the requirement for chronology;
+- fusion's ADR-9 orders a session by sequence, because device clocks jump.
+
+Ordering a session by device time would hand fusion higher sequence numbers
+first whenever the clock regresses. Fusion's reorder window is measured in
+device time, so it would then declare spurious gaps.
+
+**Decision.**
+
+- Within a session (DeviceID + BootID): extended sequence order. A
+  regressing clock produces a `clock_regression` diagnostic and never
+  reorders events.
+- Between sessions of a device: device time, when it is evidence. Heads
+  within `SessionTolerance` of the earliest are ordered by the central
+  ingestion order (store position), flagged `chronology_ambiguous`.
+- Between devices: ingestion order. Clocks of different devices are not
+  comparable, and fusion is per device.
+- The store position is a deterministic tie-breaker, never treated as
+  evidence of occurrence.
+- Each device's next event is held for `Hold` of processing time so
+  slightly late earlier events go first. Later ones are delivered flagged
+  `late`, never dropped.
+
+**Consequences.** With monotonic clocks this is exactly device-time order.
+The rule is a function of the set of candidates, not of iteration order
+(`TestSessionChoiceIsIterationIndependent`). Details:
+processing.md §2.
+
+## ADR-15: Determinism through a verified processing journal
+
+**Context.** Live ordering depends on arrival timing, and fusion's idle drain
+depends on when `Tick` is called. Neither can be recomputed from the stored
+events, yet results must be reproducible after a restart.
+
+**Decision.**
+
+- Every `Engine.Process` and `Engine.Tick` call is a journal step,
+  committed atomically with its outputs and the read cursor.
+- Recovery replays the journal into a fresh engine. Each step's outputs are
+  checked against a stored SHA-256, and each event against the event
+  store's fingerprint.
+- Unjournaled held events are re-read from the low watermark.
+- The processor never calls `Flush`.
+
+**Alternatives rejected.**
+
+- *Recompute the order from the store on restart:* it would not reproduce
+  live decisions.
+- *Snapshot engine state:* fusion deliberately offers no snapshots
+  (ADR-11), and a replay heals rather than freezes state.
+
+**Consequences.** A restart never changes, duplicates or loses persisted
+results, and every replay is verified rather than assumed. Recovery time
+grows with the journal (about 86 000 events/s on the reference machine).
+An intentional fusion change is applied with an explicit `-rebuild`, which
+rewrites outputs and keeps the order.
+
+## ADR-16: Sequence wrap-around by internal extension
+
+**Context.** `telemetry.Sequence` "may wrap around after 2³²−1", but fusion
+rejected everything after 2³²−1 (`sequence_exhausted`), contradicting the
+domain.
+
+**Decision.** Fusion and the orderer map each session's sequence numbers to
+an internal 64-bit space by bounded serial arithmetic around the highest
+number seen. A number 2³⁰ or more away is ambiguous: fusion rejects it
+(`sequence_ambiguous`), and the orderer delivers it in ingestion order. The
+public `uint32` contract, the wire format and reports are unchanged. The
+two implementations are pinned together by a parity test so that fusion
+keeps depending only on `telemetry`.
+
+**Consequences.** This amends the fusion contract (fusion.md §9 item 6,
+§11.1): `sequence_exhausted` is no longer produced and
+`sequence_ambiguous` is new. The accuracy table is byte-identical, since
+normal traffic is unaffected. The engine costs about 2% more per sample.
+
+## ADR-17: A separate results database on a shared SQLite layer
+
+**Decision.**
+
+- The processor writes `results.db` (journal, reports, estimates,
+  diagnostics) and only reads `events.db`.
+- Both databases use `internal/sqlitedb`, extracted from the event store:
+  one configuration, one migration mechanism.
+- One processor owns a results database at a time; commits are fenced on
+  ownership.
+
+**Rationale.** The event store stays the system of record, written only by
+gateways. The processor's commits do not compete with the gateways for the
+event store's write lock. Results can be rebuilt from the journal without
+touching events.
 
 ## Reserved architectural space
 

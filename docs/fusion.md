@@ -32,7 +32,7 @@ Every input sample gets exactly one final **event report**:
 | `accepted` | Released in sequence order and given to the estimator. |
 | `buffered` | Interim report: waiting in the reorder buffer. A final report follows. |
 | `duplicate` | Identical copy of an event already seen (same boot, sequence and content). Ignored. |
-| `rejected` | Not applied. `reason`: `invalid_sample`, `sequence_conflict` (same sequence, different content), `stale_session`, `device_capacity`, `sequence_exhausted` (the session already released sequence 2³²−1). |
+| `rejected` | Not applied. `reason`: `invalid_sample`, `sequence_conflict` (same sequence, different content), `stale_session`, `device_capacity`, `sequence_ambiguous` (the sequence number is 2³⁰ or more from the session's position and cannot be placed; see §9 item 6). `sequence_exhausted` is no longer produced (Task 004). |
 | `requires_reconciliation` | Plausible event that arrived after its sequence slot was finalised (`late_after_gap`, which includes numbers below the session's chosen first sequence), or older than duplicate tracking (`beyond_tracking`). Not applied. It is listed so a replay or reconciliation process can handle it. |
 
 Each closed epoch produces one **estimate** (section 6).
@@ -523,9 +523,15 @@ exactly known expected outcome.
    the same instants, as the simulator and typical devices do. Unaligned
    sources are handled by anchors, but calibration pairing and stationary
    corroboration then rarely apply.
-6. **Sequence wrap-around** (2³² events within one boot) is not supported.
-   After the maximum sequence number, further events of that session are
-   rejected (`sequence_exhausted`) rather than silently re-applied.
+6. **Sequence wrap-around is supported** (Task 004, ADR-16). Within a
+   session, sequence numbers are mapped to an internal 64-bit space by
+   bounded serial arithmetic around the highest number seen, so 2³²−1 is
+   followed by 0. The public `uint32` contract is unchanged, and reports
+   carry the wire values. A number 2³⁰ or more away from the session's
+   position, in either direction, is **ambiguous**. It could be far in the
+   past or the future, so it is rejected (`sequence_ambiguous`) rather than
+   guessed. Earlier versions rejected everything after 2³²−1
+   (`sequence_exhausted`).
 7. **Session order is heuristic**; see section 5.
 8. **GPS deadband** under-counts creeping below 0.2 m/s (2 m per 10 s).
 9. **One goroutine per engine.** Scale out by sharding devices across
@@ -544,7 +550,9 @@ exposes the window and the buffer size; other knobs are code-level for now.
 ## 11. Integration contract with the event pipeline
 
 This section states what the engine expects from an upstream ingestion
-pipeline (a UDP gateway plus a persistent event store, planned in Task 003)
+pipeline (the UDP gateway and persistent event store of Task 003, connected
+to the engine by the chronological processor of Task 004; see
+processing.md)
 and what that pipeline can expect in return. It is written against the
 domain types only. The engine does not depend on any pipeline package, and
 `internal/fusion` will continue to import only `internal/telemetry`.
@@ -555,7 +563,7 @@ domain types only. The engine does not depend on any pipeline package, and
 |---|---|---|
 | `DeviceID` | Stable per vehicle. All of a vehicle's state is keyed by it. | Any structure beyond the telemetry format rules. |
 | `BootID` | Non-zero, stays the same for one power cycle, and differs from the previous boot's. Previous values are remembered (16 per device), so reusing a recent BootID makes its events `stale_session`. | Any order. BootIDs are opaque and never compared numerically. |
-| `Sequence` | Increases by one per sample within a boot, across all sources, and restarts with each boot. It is the ordering key. | Starting at 0 or 1 (the first number is learned). Wrap-around: after 2³²−1 the session's further events are `sequence_exhausted`. |
+| `Sequence` | Increases by one per sample within a boot, across all sources, and restarts with each boot. It is the ordering key, compared by bounded serial arithmetic (§9 item 6). | Starting at 0 or 1 (the first number is learned). Not wrapping: 2³²−1 is followed by 0 within the same session. |
 | `EventID` | Nothing. It is part of the content fingerprint only. | Uniqueness. The reference producer derives it from the per-boot sequence, so it repeats across reboots (`TestEventIDReuseAcrossBootsIsNormal`). |
 
 The engine's **event identity** is `(DeviceID, BootID, Sequence)`. A content
@@ -628,10 +636,9 @@ simpler to get right, and it heals idle-drain artefacts.
 
 ### 11.5 Open points for the integration review
 
-- **Sequence wrap-around.** The engine stops a session at 2³²−1. A
-  pipeline that handles wrap with serial arithmetic will deliver
-  post-wrap events that the engine rejects as `sequence_exhausted`. That
-  is reported, not lost, but the two layers should agree on one rule.
+- **Sequence wrap-around.** *Resolved in Task 004:* the engine and the
+  chronological processor extend sequence numbers with the same rule
+  (`TestExtenderParityWithChrono`); see processing.md §2.2.
 - **Duplicate horizon.** The engine remembers 256 released events per
   session. A store that guarantees once-only delivery makes this
   irrelevant; at-least-once delivery with long delays would turn late

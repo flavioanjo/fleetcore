@@ -53,6 +53,10 @@ jobs:
         if: runner.os == 'Linux'
         run: go test -run='^$' -fuzz=FuzzObserve -fuzztime=30s ./internal/sessions
 
+      - name: Fuzz chronological orderer (short)
+        if: runner.os == 'Linux'
+        run: go test -run='^$' -fuzz=FuzzOrderer -fuzztime=30s ./internal/chrono
+
       - name: Build without cgo
         run: go build ./...
         env:

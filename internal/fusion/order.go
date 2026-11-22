@@ -8,26 +8,70 @@ import (
 	"github.com/flavioanjo/fleetcore/internal/telemetry"
 )
 
-// session orders the events of one device boot by sequence number.
+// Sequence numbers are 32-bit on the wire and may wrap around after
+// 2^32-1 (telemetry.Sequence). Inside a session the engine orders events in
+// an extended 64-bit space instead, so a wrap is just the next number. The
+// extension is internal: reports and diagnostics carry the original 32-bit
+// values.
+//
+// The mapping uses bounded serial arithmetic around the highest sequence
+// number seen in the session: a 32-bit value is placed at the nearest
+// extended position, provided that position is closer than serialLimit.
+// Values at serial distance serialLimit or more (in either direction) are
+// ambiguous, because they could be far in the past or far in the future,
+// and are rejected (ReasonSequenceAmbiguous) instead of being guessed.
+const (
+	serialLimit = 1 << 30
+	// extBase places the first sequence number of a session far enough from
+	// zero that serial distances down to -serialLimit never underflow.
+	extBase = 1 << 32
+)
+
+// seqExtender maps one session's 32-bit sequence numbers to extended ones.
+type seqExtender struct {
+	high    uint64 // highest extended sequence number observed
+	started bool
+}
+
+// extend returns the extended position of s, or false if s is ambiguous.
+// It does not change the reference; call observe for accepted numbers.
+func (x *seqExtender) extend(s telemetry.Sequence) (uint64, bool) {
+	if !x.started {
+		return extBase + uint64(s), true
+	}
+	d := int64(int32(uint32(s) - uint32(x.high))) // serial distance in [-2^31, 2^31)
+	if d >= serialLimit || d <= -serialLimit {
+		return 0, false
+	}
+	return uint64(int64(x.high) + d), true
+}
+
+func (x *seqExtender) observe(ext uint64) {
+	if !x.started || ext > x.high {
+		x.high, x.started = ext, true
+	}
+}
+
+// session orders the events of one device boot by extended sequence number.
 //
 // Invariants:
-//   - every buffered event has seq >= next once started;
+//   - every buffered event has ext >= next once started;
 //   - len(buf) <= MaxBufferedPerSession after release returns;
-//   - events are released strictly in increasing sequence order;
-//   - a sequence number below next is never released again.
+//   - events are released strictly in increasing extended sequence order;
+//   - an extended sequence number below next is never released again.
 //
 // Before the first release ("not started") the session does not know its
 // first sequence number: it buffers until the reorder window or the buffer
 // capacity forces a start at the lowest buffered sequence number.
 type session struct {
-	boot      telemetry.BootID
-	started   bool
-	start     telemetry.Sequence // first released sequence number
-	next      telemetry.Sequence
-	exhausted bool      // the maximum sequence number was released; wrap-around is unsupported
-	maxTime   time.Time // latest device time seen in this session
-	buf       map[telemetry.Sequence]telemetry.Sample
-	bufHigh   int // buffer high-water mark since the map was last reallocated
+	boot    telemetry.BootID
+	ext     seqExtender
+	started bool
+	start   uint64    // first released extended sequence number
+	next    uint64    // next extended sequence number to release
+	maxTime time.Time // latest device time seen in this session
+	buf     map[uint64]telemetry.Sample
+	bufHigh int // buffer high-water mark since the map was last reallocated
 
 	gaps    []seqRange // ring of declared-missing ranges
 	gapHead int
@@ -40,13 +84,19 @@ type session struct {
 }
 
 type recentEvent struct {
-	seq telemetry.Sequence
+	ext uint64
 	fp  uint64
 }
 
-type seqRange struct{ from, to telemetry.Sequence }
+// seqRange is an inclusive range of extended sequence numbers.
+type seqRange struct{ from, to uint64 }
 
-func (r seqRange) contains(s telemetry.Sequence) bool { return s >= r.from && s <= r.to }
+func (r seqRange) contains(e uint64) bool { return e >= r.from && e <= r.to }
+
+// fromSeq and toSeq are the range bounds as wire sequence numbers.
+func (r seqRange) fromSeq() telemetry.Sequence { return telemetry.Sequence(r.from) }
+func (r seqRange) toSeq() telemetry.Sequence   { return telemetry.Sequence(r.to) }
+func (r seqRange) count() int64                { return int64(r.to-r.from) + 1 }
 
 // released is an event leaving the buffer, with the gap declared just
 // before it (if any).
@@ -56,7 +106,7 @@ type released struct {
 }
 
 func newSession(boot telemetry.BootID, cfg *Config) *session {
-	return &session{boot: boot, buf: make(map[telemetry.Sequence]telemetry.Sample)}
+	return &session{boot: boot, buf: make(map[uint64]telemetry.Sample)}
 }
 
 // fingerprint identifies an event's content, for telling exact duplicates
@@ -78,51 +128,54 @@ func fingerprint(s telemetry.Sample) uint64 {
 }
 
 // classify decides whether s can enter the buffer. It returns
-// OutcomeAccepted when it can (the final outcome is decided on release).
-func (ss *session) classify(s telemetry.Sample) (Outcome, Reason) {
-	fp := fingerprint(s)
-	if b, ok := ss.buf[s.Sequence]; ok {
-		if fingerprint(b) == fp {
-			return OutcomeDuplicate, ReasonNone
-		}
-		return OutcomeRejected, ReasonSequenceConflict
+// OutcomeAccepted, with the extended sequence number, when it can (the final
+// outcome is decided on release).
+func (ss *session) classify(s telemetry.Sample) (Outcome, Reason, uint64) {
+	e, ok := ss.ext.extend(s.Sequence)
+	if !ok {
+		return OutcomeRejected, ReasonSequenceAmbiguous, 0
 	}
-	if !ss.started || (s.Sequence >= ss.next && !ss.exhausted) {
-		return OutcomeAccepted, ReasonNone
+	fp := fingerprint(s)
+	if b, ok := ss.buf[e]; ok {
+		if fingerprint(b) == fp {
+			return OutcomeDuplicate, ReasonNone, e
+		}
+		return OutcomeRejected, ReasonSequenceConflict, e
+	}
+	if !ss.started || e >= ss.next {
+		return OutcomeAccepted, ReasonNone, e
 	}
 	for _, r := range ss.recent {
-		if r.seq == s.Sequence {
+		if r.ext == e {
 			if r.fp == fp {
-				return OutcomeDuplicate, ReasonNone
+				return OutcomeDuplicate, ReasonNone, e
 			}
-			return OutcomeRejected, ReasonSequenceConflict
+			return OutcomeRejected, ReasonSequenceConflict, e
 		}
 	}
-	if ss.exhausted {
-		return OutcomeRejected, ReasonSequenceExhausted
-	}
-	if s.Sequence < ss.start {
-		return OutcomeRequiresReconciliation, ReasonLateAfterGap // before the session's chosen start
+	if e < ss.start {
+		return OutcomeRequiresReconciliation, ReasonLateAfterGap, e // before the session's chosen start
 	}
 	for _, g := range ss.gaps {
-		if g.contains(s.Sequence) {
-			return OutcomeRequiresReconciliation, ReasonLateAfterGap
+		if g.contains(e) {
+			return OutcomeRequiresReconciliation, ReasonLateAfterGap, e
 		}
 	}
-	return OutcomeRequiresReconciliation, ReasonBeyondTracking
+	return OutcomeRequiresReconciliation, ReasonBeyondTracking, e
 }
 
-func (ss *session) insert(s telemetry.Sample) {
-	ss.buf[s.Sequence] = s
+func (ss *session) insert(s telemetry.Sample, e uint64) {
+	ss.buf[e] = s
+	ss.ext.observe(e)
 	ss.bufHigh = max(ss.bufHigh, len(ss.buf))
 	if s.DeviceTime.After(ss.maxTime) {
 		ss.maxTime = s.DeviceTime
 	}
 }
 
-func (ss *session) minBuffered() telemetry.Sequence {
+func (ss *session) minBuffered() uint64 {
 	first := true
-	var m telemetry.Sequence
+	var m uint64
 	for k := range ss.buf {
 		if first || k < m {
 			m, first = k, false
@@ -131,9 +184,9 @@ func (ss *session) minBuffered() telemetry.Sequence {
 	return m
 }
 
-// release returns the events that may now be processed, in sequence order.
-// With force, everything buffered is released (end of input or session
-// end), declaring gaps as needed.
+// release returns the events that may now be processed, in extended
+// sequence order. With force, everything buffered is released (end of input
+// or session end), declaring gaps as needed.
 func (ss *session) release(cfg *Config, force bool) []released {
 	var out []released
 	var pendingGap *seqRange
@@ -155,18 +208,14 @@ func (ss *session) release(cfg *Config, force bool) []released {
 		}
 		s := ss.buf[ss.next]
 		delete(ss.buf, ss.next)
-		ss.remember(s, cfg)
+		ss.remember(ss.next, s, cfg)
 		out = append(out, released{sample: s, gap: pendingGap})
 		pendingGap = nil
-		if ss.next == ^telemetry.Sequence(0) {
-			ss.exhausted = true // nothing can follow without wrapping
-			break
-		}
 		ss.next++
 	}
 	if len(ss.buf) == 0 && ss.bufHigh > 16 {
 		// Go maps never shrink; drop the buckets left by a reordering burst.
-		ss.buf, ss.bufHigh = make(map[telemetry.Sequence]telemetry.Sample), 0
+		ss.buf, ss.bufHigh = make(map[uint64]telemetry.Sample), 0
 	}
 	return out
 }
@@ -180,8 +229,8 @@ func (ss *session) recordGap(g seqRange, cfg *Config) {
 	ss.gapHead = (ss.gapHead + 1) % cfg.MaxTrackedGaps
 }
 
-func (ss *session) remember(s telemetry.Sample, cfg *Config) {
-	r := recentEvent{s.Sequence, fingerprint(s)}
+func (ss *session) remember(e uint64, s telemetry.Sample, cfg *Config) {
+	r := recentEvent{e, fingerprint(s)}
 	if len(ss.recent) < cfg.RecentEvents {
 		ss.recent = append(ss.recent, r)
 		return

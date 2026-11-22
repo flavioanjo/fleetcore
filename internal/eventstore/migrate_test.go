@@ -5,14 +5,16 @@ import (
 	"errors"
 	"sync"
 	"testing"
+
+	"github.com/flavioanjo/fleetcore/internal/sqlitedb"
 )
 
 // withMigrations temporarily extends the schema history (tests in this
 // package do not run in parallel).
-func withMigrations(t *testing.T, extra ...migration) {
+func withMigrations(t *testing.T, extra ...sqlitedb.Migration) {
 	t.Helper()
 	saved := migrations
-	migrations = append(append([]migration(nil), saved...), extra...)
+	migrations = append(append([]sqlitedb.Migration(nil), saved...), extra...)
 	t.Cleanup(func() { migrations = saved })
 }
 
@@ -33,7 +35,7 @@ func TestMigrationUpgradePreservesData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	withMigrations(t, migration{version: 2, name: "test: add annotation", stmts: []string{
+	withMigrations(t, sqlitedb.Migration{Version: 2, Name: "test: add annotation", Stmts: []string{
 		`ALTER TABLE events ADD COLUMN annotation TEXT`,
 		`CREATE TABLE annotations_meta (k TEXT PRIMARY KEY) STRICT`,
 	}})
@@ -65,7 +67,7 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 	st := openStore(t, path)
 	st.Close()
 
-	withMigrations(t, migration{version: 2, name: "test: broken", stmts: []string{
+	withMigrations(t, sqlitedb.Migration{Version: 2, Name: "test: broken", Stmts: []string{
 		`CREATE TABLE partial (x INTEGER) STRICT`,
 		`THIS IS NOT SQL`,
 	}})

@@ -86,29 +86,7 @@ func TestDecreaseWhileStaleIsIgnored(t *testing.T) {
 	}
 }
 
-// Sequence wrap-around is unsupported: it must be reported, never
-// silently re-applied.
-func TestSequenceExhaustionIsReported(t *testing.T) {
-	st := newStream("W", 1)
-	st.seq = ^telemetry.Sequence(0) - 15
-	var ss []telemetry.Sample
-	for i := 0; i < 15; i++ {
-		ss = append(ss, st.tick(10*time.Second).gps(100*m))
-	}
-	resend := ss[4]
-	after := st.tick(10 * time.Second).gps(100 * m) // wraps to sequence 0
-	rs := runAll(newEngine(t), append(ss, resend, after))
-	evs := events(rs)
-	if got := evs[len(evs)-2]; got.Outcome != OutcomeDuplicate {
-		t.Fatalf("resend after exhaustion: %s/%s, want duplicate", got.Outcome, got.Reason)
-	}
-	if got := evs[len(evs)-1]; got.Outcome != OutcomeRejected || got.Reason != ReasonSequenceExhausted {
-		t.Fatalf("wrapped event: %s/%s, want rejected/sequence_exhausted", got.Outcome, got.Reason)
-	}
-	if hasDiag(rs, CodeSequenceGap) {
-		t.Fatal("wrap produced a spurious sequence gap")
-	}
-}
+// Sequence wrap-around is covered in wrap_test.go.
 
 // An event just below the session's chosen first sequence number is late,
 // not "beyond tracking".

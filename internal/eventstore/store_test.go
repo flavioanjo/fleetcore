@@ -389,3 +389,29 @@ func TestConcurrentWritersAcrossConnections(t *testing.T) {
 		t.Fatalf("inserted %d duplicate %d conflict %d", ins, dup, conf)
 	}
 }
+
+func TestByPositions(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t, tempDB(t))
+	var positions []int64
+	for i := 1; i <= 1200; i++ { // more than one query chunk
+		res := mustAppend(t, st, event(t, sample("dev-1", telemetry.EventID(i), 7, telemetry.Sequence(i), 1)), Inserted)
+		positions = append(positions, res.Position)
+	}
+	want := []int64{positions[1100], positions[3], positions[3], positions[600]}
+	recs, err := st.ByPositions(ctx, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range recs {
+		if r.Position != want[i] {
+			t.Fatalf("record %d at position %d, want %d", i, r.Position, want[i])
+		}
+	}
+	if _, err := st.ByPositions(ctx, []int64{positions[0], 999_999}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing position: %v", err)
+	}
+	if recs, err := st.ByPositions(ctx, nil); err != nil || len(recs) != 0 {
+		t.Fatalf("empty: %v %v", recs, err)
+	}
+}
