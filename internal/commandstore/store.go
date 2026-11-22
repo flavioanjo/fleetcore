@@ -338,10 +338,10 @@ func (s *Store) Create(ctx context.Context, req Request) (Command, bool, error) 
 	sort.Strings(roles)
 	deadline := rc.ExpiresAt.Add(s.policy.ResultGrace)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO commands
-		(command_id, principal, request_id, roles, justification, device_id, command_type, args,
+		(seq, command_id, principal, request_id, roles, justification, device_id, command_type, args,
 		 issued_at_ms, expires_at_ms, result_deadline_ms, authority_key_id, signature,
 		 state, next_attempt_ms, created_at_ns, updated_at_ns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES ((SELECT coalesce(max(seq), 0) + 1 FROM commands), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id[:], req.Principal.ID, req.RequestID, strings.Join(roles, ","), req.Justification, req.DeviceID,
 		int64(req.Type), rc.Args, ms(rc.IssuedAt), ms(rc.ExpiresAt), ms(deadline), int64(s.authority.KeyID()), sig,
 		string(Requested), ms(issued), now.UnixNano(), now.UnixNano()); err != nil {
@@ -462,7 +462,7 @@ func (s *Store) List(ctx context.Context, f Filter) ([]Command, error) {
 	if f.Limit <= 0 {
 		f.Limit = 1000
 	}
-	q += ` ORDER BY created_at_ns, command_id LIMIT ?`
+	q += ` ORDER BY seq LIMIT ?`
 	return listQ(ctx, s.r, q, append(args, f.Limit)...)
 }
 

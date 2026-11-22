@@ -490,7 +490,7 @@ func (r *Reliable) ack(f reliable.Frame, to netip.AddrPort, a reliable.EventAck)
 // ErrUnreachable is returned by CommandPacket when this gateway has not
 // heard an authenticated frame from the device (since start or eviction),
 // so it knows neither its address nor its current session.
-var ErrUnreachable = errors.New("gateway: device not reachable through this gateway")
+var ErrUnreachable = reliable.ErrDeviceUnreachable
 
 // CommandPacket seals a command delivery for the device's current session
 // and returns it with the device's last authenticated address.

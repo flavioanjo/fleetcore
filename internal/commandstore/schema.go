@@ -14,6 +14,10 @@ var migrations = []sqlitedb.Migration{
 		Stmts: []string{
 			`CREATE TABLE commands (
 				command_id         BLOB    PRIMARY KEY CHECK (length(command_id) = 16),
+				-- Request order: assigned max(seq)+1 in the creating transaction
+				-- (writes are serialized), so it is strictly increasing and stable
+				-- (unlike a rowid, which VACUUM may renumber on this table).
+				seq                INTEGER NOT NULL UNIQUE CHECK (seq >= 1),
 				principal          TEXT    NOT NULL CHECK (length(principal) BETWEEN 1 AND 64),
 				request_id         TEXT    NOT NULL CHECK (length(request_id) BETWEEN 1 AND 128),
 				roles              TEXT    NOT NULL,

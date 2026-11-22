@@ -52,6 +52,9 @@ func inList(states []State) (string, []any) {
 // command of the same device is in flight (actuations of one device are
 // serialized in request order, so BLOCK and UNBLOCK can never race).
 // Non-actuating commands (REQUEST_POSITION) are always eligible.
+//
+// Request order is the insertion order (column seq), not the creation
+// timestamp: two requests in the same millisecond keep their order.
 func (s *Store) Promote(ctx context.Context) (int, error) {
 	release, err := s.acquire()
 	if err != nil {
@@ -79,7 +82,7 @@ func (s *Store) Promote(ctx context.Context) (int, error) {
 		busy[d] = true
 	}
 	rows.Close()
-	cands, err := listQ(ctx, tx, `SELECT `+cmdCols+` FROM commands WHERE state = ? AND expires_at_ms > ? ORDER BY created_at_ns, command_id`,
+	cands, err := listQ(ctx, tx, `SELECT `+cmdCols+` FROM commands WHERE state = ? AND expires_at_ms > ? ORDER BY seq`,
 		string(Requested), ms(now))
 	if err != nil {
 		return 0, err
@@ -116,7 +119,7 @@ func (s *Store) Due(ctx context.Context, limit int) ([]Command, error) {
 		WHERE next_attempt_ms <= ? AND (
 			(state = 'eligible' AND expires_at_ms > ?) OR
 			(state IN ('sent', 'received', 'accepted') AND result_deadline_ms > ?))
-		ORDER BY next_attempt_ms, created_at_ns LIMIT ?`, now, now, now, limit)
+		ORDER BY next_attempt_ms, seq LIMIT ?`, now, now, now, limit)
 }
 
 // BeginAttempt records delivery attempt number n+1 as 'sending' before it

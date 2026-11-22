@@ -135,3 +135,9 @@ func CodeOf(err error) Code {
 	}
 	return 0
 }
+
+// ErrDeviceUnreachable is returned by a command transport that cannot
+// address the device: it has not heard an authenticated frame of the
+// device's current session, so it knows neither its address nor the
+// session to seal the delivery for. Dispatchers try another transport.
+var ErrDeviceUnreachable = errors.New("reliable: device not reachable through this transport")
