@@ -112,6 +112,10 @@ type EmitFunc func(telemetry.Sample) error
 // emit, in order: round by round, vehicle by vehicle, source by source.
 // Every emitted sample satisfies telemetry.Sample.Validate.
 func Run(cfg Config, emit EmitFunc) error {
+	return run(cfg, emit, nil)
+}
+
+func run(cfg Config, emit EmitFunc, truth TruthFunc) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -125,6 +129,9 @@ func Run(cfg Config, emit EmitFunc) error {
 			// describe the motion during that interval.
 			v.advance(cfg.Interval)
 			deviceTime := cfg.Start.Add(v.clockOffset + time.Duration(round+1)*cfg.Interval)
+			if truth != nil {
+				truth(Truth{DeviceID: v.id, Round: round, DeviceTime: deviceTime, DistanceMM: v.lastDelta, OdometerMM: v.odometer})
+			}
 			for _, src := range cfg.Sources {
 				s := v.sample(src, deviceTime)
 				if err := s.Validate(); err != nil {

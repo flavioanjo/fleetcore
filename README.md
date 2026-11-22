@@ -3,9 +3,10 @@
 FleetCore is a fleet telemetry simulation platform written in Go. It models
 how connected vehicles report distance travelled from several imperfect
 sensors, defines an original binary protocol for transporting those
-measurements, and generates realistic but entirely synthetic telemetry.
+measurements, generates realistic but entirely synthetic telemetry, and
+fuses the sensors into one explainable distance estimate.
 
-> **Status:** v0.1.0. Foundation only: domain model, wire protocol and simulator.
+> **Status:** v0.2.0 (in review). Domain model, wire protocol, simulator, and the telemetry fusion engine.
 
 ## Why it exists
 
@@ -22,7 +23,7 @@ The project is inspired by common problems in fleet telemetry, distributed
 systems and IoT infrastructure. All code, protocols and data are original;
 all device identifiers and telemetry are synthetic.
 
-## Features in v0.1.0
+## Features
 
 - **Telemetry domain** (`internal/telemetry`)
   - Strongly typed samples: device, event, boot/session and sequence
@@ -44,6 +45,25 @@ all device identifiers and telemetry are synthetic.
     and dropouts, a 100 m-resolution CAN odometer, and a pulse counter with a
     per-vehicle calibration error.
   - Fully reproducible from a seed, on every platform; JSON Lines output.
+  - Ground truth available only through an explicit testing API
+    (`simulator.RunWithGroundTruth`).
+- **Telemetry fusion engine** (`internal/fusion`, `cmd/fleet-fusion`, [design](docs/fusion.md))
+  - Per-device distance estimation from GPS deltas, the 100 m CAN odometer
+    and the pulse counter: inverse-variance fusion and CAN interval
+    reconciliation.
+  - Conservative pulse calibration (≥ 20 km CAN or GPS reference) and source
+    health checks.
+  - Explicit handling of missing measurements, including interpolation of
+    short uncovered spans.
+  - Bounded reordering by sequence number. Duplicates, conflicts, gaps,
+    late events, reboots, stale sessions and clock problems each have a
+    defined, reported outcome.
+  - Structured, machine-readable diagnostics and uncertainty for every
+    estimate.
+  - Deterministic, integer arithmetic, finite memory (~5 KB per device).
+- **Evaluation harness** (`internal/evaluation`, `cmd/fleet-eval`)
+  - Compares fusion with simulator ground truth and simple baselines,
+    across source combinations, seeds and delivery perturbations.
 
 ## Requirements
 
@@ -78,6 +98,33 @@ Flags:
 Samples are ordered by round, then by vehicle, then by source. A missing
 measurement has `"quality":"unavailable"` and `"distance":null`.
 
+### Fuse telemetry
+
+```bash
+# Simulate, fuse, and print one summary line per vehicle
+go run ./cmd/fleet-sim -vehicles 2 -samples 360 -interval 10s \
+  | go run ./cmd/fleet-fusion -events none -summary
+
+# Keep everything: every event disposition and every estimate
+go run ./cmd/fleet-fusion -in samples.jsonl -events all > reports.jsonl
+```
+
+`fleet-fusion` writes JSON Lines with a `type` of `event`, `estimate`,
+`input_error` (an undecodable line: reported, never dropped; the exit
+status is then 1) or `summary`. Flags: `-in`, `-events all|issues|none`,
+`-summary`, `-strict`, `-window`, `-max-buffer`. The output format is
+described in [docs/fusion.md](docs/fusion.md#6-output).
+
+### Evaluate accuracy
+
+```bash
+go run ./cmd/fleet-eval -seeds 1,2,3,4,5 -perturb
+```
+
+This prints, for every source combination, the fused error against ground
+truth next to the naive and CAN-difference baselines. Current results are
+in [docs/fusion.md §8](docs/fusion.md#8-accuracy-evaluation).
+
 ## Tests
 
 ```bash
@@ -90,22 +137,38 @@ go test -run='^$' -fuzz=FuzzDecodeSample -fuzztime=60s ./internal/protocol
 
 # Regenerate the simulator golden file after an intentional model change
 go test ./internal/simulator -run Golden -update
+
+# Fusion throughput and memory benchmarks
+go test -run '^$' -bench . ./internal/fusion
+
+# Skip the 24-hour simulation test
+go test -short ./...
 ```
 
-CI (`.github/workflows/ci.yml`) runs formatting, vet, build, tests, the race
-detector, a short fuzz session and a reproducibility smoke test.
+CI (`.github/workflows/ci.yml`) runs:
+
+- formatting, vet, build and tests;
+- the race detector and a short fuzz session;
+- a reproducibility smoke test;
+- the accuracy evaluation, as part of the tests.
 
 ## Repository structure
 
 ```text
 fleetcore/
-├── cmd/fleet-sim/          CLI: synthetic telemetry as JSON Lines
+├── cmd/
+│   ├── fleet-sim/          CLI: synthetic telemetry as JSON Lines
+│   ├── fleet-fusion/       CLI: fuse JSON Lines telemetry into estimates
+│   └── fleet-eval/         CLI: accuracy evaluation table
 ├── internal/
 │   ├── telemetry/          domain model and validation
 │   ├── protocol/           binary wire format
-│   └── simulator/          deterministic fleet simulator (+ testdata/ golden file)
+│   ├── simulator/          deterministic fleet simulator (+ testdata/ golden file, test-only ground truth)
+│   ├── fusion/             telemetry fusion engine
+│   └── evaluation/         accuracy harness (tooling, not production)
 ├── docs/
 │   ├── architecture.md     architectural decisions
+│   ├── fusion.md           fusion engine design and evaluation
 │   └── protocol.md         wire format specification
 ├── .github/workflows/ci.yml
 ├── COPYRIGHT
@@ -114,19 +177,23 @@ fleetcore/
 
 ## Roadmap
 
+Done: ~~Telemetry Fusion Engine~~ (v0.2.0).
+
 Planned, not implemented. See [docs/architecture.md](docs/architecture.md)
 for where each piece is expected to fit.
 
-1. **Telemetry Fusion Engine:** reconcile GPS, CAN and pulse distances into
-   one trustworthy odometer.
-2. **UDP Gateway:** receive protocol packets and stamp ingestion time.
-3. **Device Session Registry:** track boots and detect sequence gaps, replays
-   and reordering.
-4. **Persistent Event Store:** durable, deduplicated storage by event ID.
-5. **Diagnostics and Observability:** metrics and structured logs.
-6. **Command Dispatcher** and **Firmware Transfer Service:** downlink
+1. **UDP Gateway:** receive protocol packets, stamp ingestion time, feed the
+   fusion engine.
+2. **Device Session Registry:** shared tracking of boots, sequence gaps,
+   replays and reordering.
+3. **Persistent Event Store:** durable, deduplicated storage by event ID.
+   This enables replay-based fusion recovery and the reconciliation of late
+   events.
+4. **Diagnostics and Observability:** metrics and structured logs, fed by
+   fusion diagnostics.
+5. **Command Dispatcher** and **Firmware Transfer Service:** downlink
    messages (protocol v2).
-7. **Event Replicator:** replicate stored events to other consumers.
+6. **Event Replicator:** replicate stored events to other consumers.
 
 ## Copyright
 

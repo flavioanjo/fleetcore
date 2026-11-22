@@ -56,3 +56,11 @@ jobs:
           go run ./cmd/fleet-sim -seed 7 -vehicles 2 -samples 3 > b.jsonl
           cmp a.jsonl b.jsonl
           test "$(wc -l < a.jsonl)" -eq 18
+
+      - name: Fusion smoke test
+        if: runner.os == 'Linux'
+        run: |
+          go run ./cmd/fleet-sim -vehicles 3 -samples 360 -interval 10s > sim.jsonl
+          go run ./cmd/fleet-fusion -in sim.jsonl -events none -summary > fused.jsonl
+          test "$(grep -c '"type":"summary"' fused.jsonl)" -eq 3
+          test "$(grep -c '"type":"estimate"' fused.jsonl)" -eq 1080
