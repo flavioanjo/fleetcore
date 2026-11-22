@@ -49,6 +49,15 @@ jobs:
         if: runner.os == 'Linux'
         run: go test -run='^$' -fuzz=FuzzDecodeSample -fuzztime=30s ./internal/protocol
 
+      - name: Fuzz session registry (short)
+        if: runner.os == 'Linux'
+        run: go test -run='^$' -fuzz=FuzzObserve -fuzztime=30s ./internal/sessions
+
+      - name: Build without cgo
+        run: go build ./...
+        env:
+          CGO_ENABLED: "0"
+
       - name: Simulator smoke test
         if: runner.os == 'Linux'
         run: |

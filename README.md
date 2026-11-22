@@ -5,7 +5,8 @@ how connected vehicles report distance travelled from several imperfect
 sensors, defines an original binary protocol for transporting those
 measurements, and generates realistic but entirely synthetic telemetry.
 
-> **Status:** v0.1.0. Foundation only: domain model, wire protocol and simulator.
+> **Status:** v0.1.0 foundation (domain model, wire protocol, simulator)
+> plus the event ingestion pipeline (UDP gateway, session registry, event store).
 
 ## Why it exists
 
@@ -45,9 +46,39 @@ all device identifiers and telemetry are synthetic.
     per-vehicle calibration error.
   - Fully reproducible from a seed, on every platform; JSON Lines output.
 
+## Event ingestion
+
+`cmd/fleet-gateway` receives protocol packets over UDP, validates them,
+stamps their ingestion time, deduplicates them by durable event identity
+and stores them in a local SQLite database, while tracking device sessions
+(gaps, reordering, reboots). See [docs/ingestion.md](docs/ingestion.md).
+
+```bash
+go run ./cmd/fleet-gateway -listen 127.0.0.1:7400 -db fleetcore-events.db -log-format text
+```
+
+- **Identity:** `(DeviceID, BootID, EventID)` plus a SHA-256 fingerprint of
+  the canonical packet. Retransmissions are idempotent. A different payload
+  for a stored identity is kept as a conflict and never overwrites.
+  EventIDs reused across boots are stored and reported.
+- **Durability:** accepted events are committed in SQLite (WAL,
+  `synchronous=FULL`) in atomic batches. Deduplication survives restarts.
+- **No delivery guarantee to senders:** protocol v1 has no
+  acknowledgements, so a device cannot know whether a packet was stored and
+  must retransmit if it needs delivery.
+- **Bounded resources:** fixed goroutines, bounded queues with one explicit
+  drop point, and capped in-memory session tracking. Session diagnostics are
+  provisional and in memory only.
+
+Packets carry a CRC-32C, which detects corruption but does **not**
+authenticate senders; run the gateway only on trusted networks.
+
 ## Requirements
 
-- Go 1.23 or later. No third-party dependencies.
+- Go 1.23 or later.
+- One third-party dependency: the pure-Go SQLite driver `modernc.org/sqlite`
+  (used by the event store; no cgo required). Everything else uses the
+  standard library.
 
 ## Build and run
 
@@ -85,8 +116,9 @@ go test ./...
 go test -race ./...      # requires cgo (a C toolchain) on Windows
 go vet ./...
 
-# Optional: fuzz the protocol decoder
+# Optional: fuzz the protocol decoder and the session registry
 go test -run='^$' -fuzz=FuzzDecodeSample -fuzztime=60s ./internal/protocol
+go test -run='^$' -fuzz=FuzzObserve -fuzztime=60s ./internal/sessions
 
 # Regenerate the simulator golden file after an intentional model change
 go test ./internal/simulator -run Golden -update
@@ -99,13 +131,19 @@ detector, a short fuzz session and a reproducibility smoke test.
 
 ```text
 fleetcore/
-├── cmd/fleet-sim/          CLI: synthetic telemetry as JSON Lines
+├── cmd/
+│   ├── fleet-sim/          CLI: synthetic telemetry as JSON Lines
+│   └── fleet-gateway/      UDP ingestion gateway with SQLite storage
 ├── internal/
 │   ├── telemetry/          domain model and validation
 │   ├── protocol/           binary wire format
-│   └── simulator/          deterministic fleet simulator (+ testdata/ golden file)
+│   ├── simulator/          deterministic fleet simulator (+ testdata/ golden file)
+│   ├── gateway/            UDP receiver, bounded pipeline, graceful shutdown
+│   ├── sessions/           device session registry and ordering diagnostics
+│   └── eventstore/         durable, deduplicated event storage (SQLite)
 ├── docs/
 │   ├── architecture.md     architectural decisions
+│   ├── ingestion.md        ingestion pipeline: identity, backpressure, storage
 │   └── protocol.md         wire format specification
 ├── .github/workflows/ci.yml
 ├── COPYRIGHT
@@ -120,9 +158,11 @@ for where each piece is expected to fit.
 1. **Telemetry Fusion Engine:** reconcile GPS, CAN and pulse distances into
    one trustworthy odometer.
 2. **UDP Gateway:** receive protocol packets and stamp ingestion time.
+   *Implemented ([docs/ingestion.md](docs/ingestion.md)).*
 3. **Device Session Registry:** track boots and detect sequence gaps, replays
-   and reordering.
+   and reordering. *Implemented.*
 4. **Persistent Event Store:** durable, deduplicated storage by event ID.
+   *Implemented (SQLite).*
 5. **Diagnostics and Observability:** metrics and structured logs.
 6. **Command Dispatcher** and **Firmware Transfer Service:** downlink
    messages (protocol v2).
