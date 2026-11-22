@@ -163,6 +163,7 @@ const (
 	CodeOutOfOrderBuffered  Code = "out_of_order_buffered"
 	CodeReleasedFromBuffer  Code = "released_from_buffer"
 	CodeSequenceGap         Code = "sequence_gap"
+	CodeIdleFlush           Code = "idle_flush"
 	CodeSessionStarted      Code = "session_started"
 	CodeSessionTransition   Code = "session_transition"
 	CodeSessionOrderUnclear Code = "session_order_ambiguous"

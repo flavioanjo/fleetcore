@@ -3,6 +3,7 @@ package fusion
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/flavioanjo/fleetcore/internal/telemetry"
 )
@@ -36,6 +37,10 @@ type device struct {
 	cand    telemetry.BootID // unknown "older" BootID seen consecutively
 	candN   int
 	est     *estimator
+
+	// Processing-time idleness, driven only by Engine.Tick.
+	active   bool      // Process was called since the last Tick
+	lastTick time.Time // Tick time at which activity was last observed
 }
 
 // New returns an engine, or an error if cfg is invalid.
@@ -82,7 +87,53 @@ func (e *Engine) Process(s telemetry.Sample) []Report {
 		d = &device{id: s.DeviceID, closed: make([]telemetry.BootID, 0, e.cfg.MaxClosedSessions), est: newEstimator(&e.cfg, s.DeviceID)}
 		e.devices[s.DeviceID] = d
 	}
+	d.active = true
 	d.process(e, s, &out)
+	return out.list
+}
+
+// Tick advances the engine's processing clock to now, which the caller
+// supplies (wall clock in a live pipeline, any monotonic clock in tests).
+//
+// ReorderWindow is measured in device time, which advances only when a
+// device sends something. A device that goes silent while events wait in
+// its reorder buffer, or while its last epoch is still open, would keep
+// them forever. Tick drains such a device once it has been idle for
+// IdleTimeout of processing time: buffered events are released (declaring
+// gaps), the open epoch is closed, and an idle_flush diagnostic is attached.
+// The session stays open; later events continue it.
+//
+// Idleness is observed at tick granularity: a device is drained between
+// IdleTimeout and IdleTimeout plus one tick period after its last event.
+// Calls are optional; without them nothing is drained before Flush. Because
+// ticks influence the output, a replay that must reproduce a live run has
+// to tick at the same points (or neither run ticks).
+func (e *Engine) Tick(now time.Time) []Report {
+	var idle []telemetry.DeviceID
+	for id, d := range e.devices {
+		if d.cur == nil || (len(d.cur.buf) == 0 && !d.est.ep.open) {
+			d.active = false
+			continue
+		}
+		if d.active || d.lastTick.IsZero() {
+			d.active, d.lastTick = false, now
+			continue
+		}
+		if now.Sub(d.lastTick) >= e.cfg.IdleTimeout {
+			idle = append(idle, id)
+		}
+	}
+	sort.Slice(idle, func(i, j int) bool { return idle[i] < idle[j] })
+	var out reports
+	for _, id := range idle {
+		d := e.devices[id]
+		d.est.pending = append(d.est.pending, diag(CodeIdleFlush, LevelInfo,
+			fmt.Sprintf("no events for %s of processing time; buffered events released and the open epoch closed", now.Sub(d.lastTick))).
+			withValue(now.Sub(d.lastTick).Milliseconds()))
+		d.drain(e, &out, true)
+		out.estimates(e, d.est.endSession())
+		d.lastTick = time.Time{}
+	}
 	return out.list
 }
 

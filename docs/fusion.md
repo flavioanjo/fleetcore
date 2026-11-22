@@ -121,6 +121,50 @@ at the same instant are fused together.
 - A device time earlier than the previous epoch is processed in sequence
   order, with elapsed-time checks skipped (`clock_regression`).
 
+### 3.5 Device-time window vs. processing-time timeout
+
+The two clocks bound different things.
+
+| | `ReorderWindow` (30 s) | `IdleTimeout` (60 s) |
+|---|---|---|
+| Clock | Device time of the session: the latest `device_time` seen. | Processing time, supplied by the caller through `Engine.Tick(now)`. |
+| Advances when | The device sends a newer event. | The caller ticks, whether or not anything arrives. |
+| Decides | How long a missing sequence number is waited for **while the device keeps talking**. | When a **silent** device's pending work is released. |
+| Effect | Declares a gap; later events continue. | Releases all buffered events (declaring gaps), closes the open epoch, adds `idle_flush`; the session stays open. |
+| Deterministic for | The input order. | The input order together with the tick schedule. |
+
+**Why both are needed.** Device time stops when the device stops. Take a
+device that sends events 18 and 19 while 17 is lost, then goes quiet (it is
+parked, out of coverage, or switched off). It never produces a later device
+timestamp, so the reorder window never expires. Without `Tick`, events 18
+and 19, and its last open epoch, would wait until `Flush`, which a live
+pipeline never calls. The same holds for a device that sends less than one
+window of data after a reboot, because session start-up buffering waits on
+the same clock. `TestSilentDeviceAfterOutOfOrderEvents` and
+`TestShortLivedDeviceIsReleasedByTick` show both behaviours.
+
+**Tick semantics.**
+
+- Each tick first records whether a device was active since the previous
+  tick. A device with pending work that has been inactive for
+  `IdleTimeout` since the last tick that saw it active is drained. Drain
+  latency is therefore between `IdleTimeout` and `IdleTimeout` plus one
+  tick period.
+- Devices with nothing pending are skipped. Drained devices are processed
+  in DeviceID order.
+- An event that arrives after an idle drain for a slot that was declared
+  missing is `requires_reconciliation` / `late_after_gap`. The next
+  in-order events continue the session normally.
+- Ticking never changes the result for devices that keep sending
+  (`TestTickLeavesActiveDevicesAlone`).
+
+**Replay.** Ticks are part of the input. A replay reproduces a live run
+only if it ticks at the same points. The simplest rule is that live
+consumers tick, and replays do not tick and call `Flush` at the end.
+Consequently, a replay can apply events that the live run released early
+as gaps, and the replay is the more complete result. `fleet-fusion` reads
+a finite input and does not tick.
+
 ## 4. Fusion algorithm
 
 All arithmetic is integer, in millimetres. Products that could exceed 64
@@ -493,6 +537,107 @@ exactly known expected outcome.
 ## 10. Configuration reference
 
 All knobs are fields of `fusion.Config`, documented in `config.go`. The
-defaults are generic (MaxSpeed 70 m/s, CAN resolution 100 m, 30 s window)
-and are validated by `Config.Validate`. The CLI exposes the window and the
-buffer size; other knobs are code-level for now.
+defaults are generic (MaxSpeed 70 m/s, CAN resolution 100 m, 30 s reorder
+window, 60 s idle timeout) and are validated by `Config.Validate`. The CLI
+exposes the window and the buffer size; other knobs are code-level for now.
+
+## 11. Integration contract with the event pipeline
+
+This section states what the engine expects from an upstream ingestion
+pipeline (a UDP gateway plus a persistent event store, planned in Task 003)
+and what that pipeline can expect in return. It is written against the
+domain types only. The engine does not depend on any pipeline package, and
+`internal/fusion` will continue to import only `internal/telemetry`.
+
+### 11.1 Identity invariants
+
+| Field | What the engine assumes | What it does **not** assume |
+|---|---|---|
+| `DeviceID` | Stable per vehicle. All of a vehicle's state is keyed by it. | Any structure beyond the telemetry format rules. |
+| `BootID` | Non-zero, stays the same for one power cycle, and differs from the previous boot's. Previous values are remembered (16 per device), so reusing a recent BootID makes its events `stale_session`. | Any order. BootIDs are opaque and never compared numerically. |
+| `Sequence` | Increases by one per sample within a boot, across all sources, and restarts with each boot. It is the ordering key. | Starting at 0 or 1 (the first number is learned). Wrap-around: after 2³²−1 the session's further events are `sequence_exhausted`. |
+| `EventID` | Nothing. It is part of the content fingerprint only. | Uniqueness. The reference producer derives it from the per-boot sequence, so it repeats across reboots (`TestEventIDReuseAcrossBootsIsNormal`). |
+
+The engine's **event identity** is `(DeviceID, BootID, Sequence)`. A content
+fingerprint covers EventID, device time, source, quality and distance:
+
+| Seen by the engine | Outcome |
+|---|---|
+| Same identity, same content (retransmission, any `IngestedAt`) | `duplicate` |
+| Same identity, different content, including a different EventID | `rejected` / `sequence_conflict`. The first one released wins. |
+| Same EventID in two different `(BootID, Sequence)` slots | Two independent events. |
+
+A durable store keyed by `(DeviceID, BootID, EventID)` classifies these
+cases differently:
+
+- it stores both events of a reused `(BootID, Sequence)` with different
+  EventIDs, and the engine then rejects the second as a sequence conflict;
+- it treats the same EventID in two sequence slots as a conflict and
+  delivers only the first.
+
+Each layer reports what it rejects, so nothing is lost silently. A
+consumer that needs a single answer should treat the store's
+classification as authoritative for storage and the engine's as
+authoritative for distance.
+
+### 11.2 Input the engine expects
+
+1. **Samples as `telemetry.Sample`**, with `IngestedAt` set by the
+   receiver. The engine re-validates every sample (invalid →
+   `rejected` / `invalid_sample`) and uses `IngestedAt` only for
+   diagnostics.
+2. **Each stored event delivered once, in a fixed, reproducible order**,
+   for example the store's append order. Arrival order need not be
+   chronological; the engine reorders within each session. Re-delivering
+   events is harmless (`duplicate`) but wastes the fingerprint window
+   (256 events), beyond which a re-delivery is classified
+   `beyond_tracking`.
+3. **One engine per goroutine.** `Process` is synchronous, at about
+   1 µs/sample, and does no I/O. To scale out, shard devices by DeviceID
+   across engines; a device must always reach the same engine.
+4. **`Tick(now)` periodically** in live operation, for example once per
+   second with the processing clock; see §3.5. `Flush` is for the end of a
+   finite input or for an orderly shutdown, after which the engine must not
+   be reused.
+
+### 11.3 What the engine returns
+
+- One final **event report** per input sample. The outcome tells a
+  pipeline what fusion did with a stored event. `requires_reconciliation`
+  events are the ones a later reconciliation or replay step should
+  revisit.
+- **Estimates** per epoch, with `trip_mm`, `uncertainty_mm`, `state` and
+  diagnostics. They are emitted when an epoch closes: at the next epoch's
+  first event, at a gap, at an idle drain, or at `Flush`.
+- Reports are plain data. The engine logs nothing. Persisting, counting or
+  alerting on diagnostics is the caller's job.
+
+### 11.4 Recovery
+
+Fusion state is in memory only (§9). With an append-only store, recovery
+is **deterministic replay**:
+
+- feed the stored events, in store order, into a fresh engine, without
+  ticks, then `Flush` (`TestReplayReproducesOutput`);
+- the replay output is reproducible bit for bit;
+- it can differ from what a live, ticking engine emitted only where idle
+  drains released events early (§3.5).
+
+Snapshotting estimator state is deliberately not offered. Replay is
+simpler to get right, and it heals idle-drain artefacts.
+
+### 11.5 Open points for the integration review
+
+- **Sequence wrap-around.** The engine stops a session at 2³²−1. A
+  pipeline that handles wrap with serial arithmetic will deliver
+  post-wrap events that the engine rejects as `sequence_exhausted`. That
+  is reported, not lost, but the two layers should agree on one rule.
+- **Duplicate horizon.** The engine remembers 256 released events per
+  session. A store that guarantees once-only delivery makes this
+  irrelevant; at-least-once delivery with long delays would turn late
+  re-deliveries into `beyond_tracking`.
+- **Session ordering.** The engine orders unknown boots by device time,
+  adopting after 32 consecutive events. A pipeline-side session registry
+  may order them differently (for example by first observation). Fusion
+  keeps its own rule. A shared session registry, as planned, would remove
+  the duplication.

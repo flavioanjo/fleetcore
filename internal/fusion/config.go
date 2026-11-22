@@ -30,12 +30,18 @@ type SourceModel struct {
 // fields as needed; New validates the result.
 type Config struct {
 	// Ordering and memory bounds.
-	ReorderWindow         time.Duration // device-time lateness tolerated before a sequence gap is declared
-	MaxBufferedPerSession int           // reorder buffer capacity per device session
-	MaxTrackedGaps        int           // declared-missing sequence ranges remembered per session
-	RecentEvents          int           // processed-event fingerprints remembered per session (duplicate detection)
-	MaxClosedSessions     int           // previous BootIDs remembered per device
-	MaxDevices            int           // devices tracked by one engine
+	ReorderWindow time.Duration // device-time lateness tolerated before a sequence gap is declared
+	// IdleTimeout is a processing-time limit, applied only by Engine.Tick:
+	// a device with buffered events or an open epoch that receives nothing
+	// for this long is drained (gaps declared, epoch closed). ReorderWindow
+	// alone cannot do this, because device time only advances when the
+	// device sends something.
+	IdleTimeout           time.Duration
+	MaxBufferedPerSession int // reorder buffer capacity per device session
+	MaxTrackedGaps        int // declared-missing sequence ranges remembered per session
+	RecentEvents          int // processed-event fingerprints remembered per session (duplicate detection)
+	MaxClosedSessions     int // previous BootIDs remembered per device
+	MaxDevices            int // devices tracked by one engine
 
 	// Session handling.
 	SessionSkewTolerance time.Duration // an unknown BootID older than the current session by more than this is treated as stale
@@ -86,6 +92,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		ReorderWindow:         30 * time.Second,
+		IdleTimeout:           time.Minute,
 		MaxBufferedPerSession: 256,
 		MaxTrackedGaps:        64,
 		RecentEvents:          256,
@@ -144,6 +151,7 @@ func (c Config) Validate() error {
 		v    int64
 	}{
 		{"ReorderWindow", int64(c.ReorderWindow)},
+		{"IdleTimeout", int64(c.IdleTimeout)},
 		{"MaxBufferedPerSession", int64(c.MaxBufferedPerSession)},
 		{"MaxTrackedGaps", int64(c.MaxTrackedGaps)},
 		{"RecentEvents", int64(c.RecentEvents)},

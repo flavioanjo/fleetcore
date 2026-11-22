@@ -124,12 +124,15 @@ clear value (for example a metrics library for observability).
 **Context.** Fusion must later be fed by a UDP gateway and by replay from a
 persistent event store, and must stay testable without either.
 
-**Decision.** `fusion.Engine` is a plain library with two calls:
+**Decision.** `fusion.Engine` is a plain library with three calls:
 
 - `Process(sample) []Report`
+- `Tick(now) []Report`, a processing clock supplied by the caller that
+  drains silent devices (see fusion.md §3.5)
 - `Flush() []Report`
 
-It has no goroutines, no I/O, no wall clock and no logging. Reports
+It has no goroutines, no I/O, no wall clock of its own and no logging. The
+integration contract with the event pipeline is in fusion.md §11. Reports
 (event dispositions and estimates, with structured diagnostics) are data
 returned to the caller.
 
