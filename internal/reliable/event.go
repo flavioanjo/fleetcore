@@ -115,7 +115,7 @@ type EventUpload struct {
 
 // Encode returns the canonical payload.
 func (e EventUpload) Encode() ([]byte, error) {
-	if e.UID == 0 || !e.Type.Valid() || !inRange(e.DeviceTime) || len(e.Body) > MaxEventBody {
+	if e.UID == 0 || e.UID > MaxIdentity || !e.Type.Valid() || !inRange(e.DeviceTime) || len(e.Body) > MaxEventBody {
 		return nil, errf(CodeInvalidEvent, "uid, type, time or body size invalid")
 	}
 	b := make([]byte, 0, 19+len(e.Body))
@@ -138,8 +138,8 @@ func DecodeEventUpload(p []byte) (EventUpload, error) {
 	if err := r.done(); err != nil {
 		return EventUpload{}, err
 	}
-	if e.UID == 0 {
-		return EventUpload{}, errf(CodeInvalidEvent, "zero event uid")
+	if e.UID == 0 || e.UID > MaxIdentity {
+		return EventUpload{}, errf(CodeInvalidEvent, "event uid 0 or above 2^63-1")
 	}
 	if !e.Type.Valid() {
 		return EventUpload{}, errf(CodeInvalidEvent, "unknown event type %d", uint8(e.Type))

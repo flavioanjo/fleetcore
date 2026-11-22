@@ -52,6 +52,11 @@ const (
 	MaxPacketSize = 512
 	// MinPacketSize is a packet with a 1-byte device id and no payload.
 	MinPacketSize = FixedHeaderSize + 1 + TagSize
+	// MaxIdentity bounds session generations and event UIDs (2^63-1), so
+	// they are stored as non-negative SQLite integers and compare correctly.
+	// A device incrementing either once per millisecond would need 292
+	// million years to reach it.
+	MaxIdentity = 1<<63 - 1
 	// MaxPayloadSize is the largest payload with a 1-byte device id.
 	MaxPayloadSize = MaxPacketSize - MinPacketSize
 )
@@ -126,6 +131,9 @@ func (h Header) validate() error {
 	}
 	if h.KeyID == 0 || h.SessionGen == 0 || h.Counter == 0 {
 		return errf(CodeBadHeader, "key id, session generation and counter must be non-zero")
+	}
+	if h.SessionGen > MaxIdentity {
+		return errf(CodeBadHeader, "session generation above 2^63-1")
 	}
 	return nil
 }

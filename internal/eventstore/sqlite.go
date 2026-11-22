@@ -131,6 +131,33 @@ func (s *Store) AppendBatch(ctx context.Context, evs []Event) ([]Result, error) 
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after Commit
 
+	a, err := newAppender(ctx, tx, s.now().UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	defer a.close()
+	results := make([]Result, len(evs))
+	for i, ev := range evs {
+		if results[i], err = a.append(ctx, ev); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("eventstore: commit: %w", err)
+	}
+	return results, nil
+}
+
+// appender classifies and stores version-1 events inside a caller's
+// transaction. AppendBatch and AppendReliable share it, so both apply
+// exactly the same identity and conflict rules.
+type appender struct {
+	tx                 *sql.Tx
+	insert, otherBoots *sql.Stmt
+	storedAt           int64
+}
+
+func newAppender(ctx context.Context, tx *sql.Tx, storedAt int64) (*appender, error) {
 	insert, err := tx.PrepareContext(ctx, `INSERT INTO events
 		(device_id, boot_id, event_id, sequence, device_time_ms, ingested_at_ns,
 		 source, quality, distance_kind, distance_mm, fingerprint, packet, stored_at_ns)
@@ -140,73 +167,71 @@ func (s *Store) AppendBatch(ctx context.Context, evs []Event) ([]Result, error) 
 	if err != nil {
 		return nil, fmt.Errorf("eventstore: prepare: %w", err)
 	}
-	defer insert.Close()
 	otherBoots, err := tx.PrepareContext(ctx, `SELECT boot_id FROM events
 		WHERE device_id = ? AND event_id = ? AND boot_id <> ?
 		ORDER BY position LIMIT ?`)
 	if err != nil {
+		insert.Close()
 		return nil, fmt.Errorf("eventstore: prepare: %w", err)
 	}
-	defer otherBoots.Close()
+	return &appender{tx: tx, insert: insert, otherBoots: otherBoots, storedAt: storedAt}, nil
+}
 
-	storedAt := s.now().UnixNano()
-	results := make([]Result, len(evs))
-	for i, ev := range evs {
-		smp := ev.Sample
-		ing, _ := smp.IngestedAt.Get()
-		var kind, mm sql.NullInt64
-		if d, ok := smp.Distance.Get(); ok {
-			kind = sql.NullInt64{Int64: int64(d.Kind), Valid: true}
-			mm = sql.NullInt64{Int64: int64(d.Value), Valid: true}
-		}
-		var pos int64
-		err := insert.QueryRowContext(ctx,
-			string(smp.DeviceID), int64(smp.BootID), int64(smp.EventID), int64(smp.Sequence),
-			smp.DeviceTime.UnixMilli(), ing.UnixNano(), int64(smp.Source), int64(smp.Quality),
-			kind, mm, ev.Fingerprint[:], ev.Packet, storedAt,
-		).Scan(&pos)
-		switch {
-		case err == nil:
-			reused, err := queryBoots(ctx, otherBoots, smp)
-			if err != nil {
-				return nil, fmt.Errorf("eventstore: cross-boot check %s: %w", ev.Key(), err)
-			}
-			results[i] = Result{Outcome: Inserted, Position: pos, Existing: ev.Fingerprint, EventIDAlsoInBoots: reused}
-			continue
-		case !errors.Is(err, sql.ErrNoRows):
-			return nil, fmt.Errorf("eventstore: insert %s: %w", ev.Key(), err)
-		}
+func (a *appender) close() {
+	a.insert.Close()
+	a.otherBoots.Close()
+}
 
-		// Identity already stored: compare payloads.
-		var fp []byte
-		if err := tx.QueryRowContext(ctx, `SELECT position, fingerprint FROM events
-			WHERE device_id = ? AND boot_id = ? AND event_id = ?`,
-			string(smp.DeviceID), int64(smp.BootID), int64(smp.EventID)).Scan(&pos, &fp); err != nil {
-			return nil, fmt.Errorf("eventstore: lookup %s: %w", ev.Key(), err)
-		}
-		var existing Fingerprint
-		copy(existing[:], fp)
-		if existing == ev.Fingerprint {
-			results[i] = Result{Outcome: Duplicate, Position: pos, Existing: existing}
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO event_conflicts
-			(device_id, boot_id, event_id, fingerprint, packet, first_seen_ns, last_seen_ns, receipts)
-			VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-			ON CONFLICT (device_id, boot_id, event_id, fingerprint) DO UPDATE SET
-				receipts      = receipts + 1,
-				first_seen_ns = min(first_seen_ns, excluded.first_seen_ns),
-				last_seen_ns  = max(last_seen_ns, excluded.last_seen_ns)`,
-			string(smp.DeviceID), int64(smp.BootID), int64(smp.EventID), ev.Fingerprint[:], ev.Packet, ing.UnixNano(), ing.UnixNano(),
-		); err != nil {
-			return nil, fmt.Errorf("eventstore: record conflict %s: %w", ev.Key(), err)
-		}
-		results[i] = Result{Outcome: Conflict, Position: pos, Existing: existing}
+func (a *appender) append(ctx context.Context, ev Event) (Result, error) {
+	tx := a.tx
+	smp := ev.Sample
+	ing, _ := smp.IngestedAt.Get()
+	var kind, mm sql.NullInt64
+	if d, ok := smp.Distance.Get(); ok {
+		kind = sql.NullInt64{Int64: int64(d.Kind), Valid: true}
+		mm = sql.NullInt64{Int64: int64(d.Value), Valid: true}
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("eventstore: commit: %w", err)
+	var pos int64
+	err := a.insert.QueryRowContext(ctx,
+		string(smp.DeviceID), int64(smp.BootID), int64(smp.EventID), int64(smp.Sequence),
+		smp.DeviceTime.UnixMilli(), ing.UnixNano(), int64(smp.Source), int64(smp.Quality),
+		kind, mm, ev.Fingerprint[:], ev.Packet, a.storedAt,
+	).Scan(&pos)
+	switch {
+	case err == nil:
+		reused, err := queryBoots(ctx, a.otherBoots, smp)
+		if err != nil {
+			return Result{}, fmt.Errorf("eventstore: cross-boot check %s: %w", ev.Key(), err)
+		}
+		return Result{Outcome: Inserted, Position: pos, Existing: ev.Fingerprint, EventIDAlsoInBoots: reused}, nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return Result{}, fmt.Errorf("eventstore: insert %s: %w", ev.Key(), err)
 	}
-	return results, nil
+
+	// Identity already stored: compare payloads.
+	var fp []byte
+	if err := tx.QueryRowContext(ctx, `SELECT position, fingerprint FROM events
+		WHERE device_id = ? AND boot_id = ? AND event_id = ?`,
+		string(smp.DeviceID), int64(smp.BootID), int64(smp.EventID)).Scan(&pos, &fp); err != nil {
+		return Result{}, fmt.Errorf("eventstore: lookup %s: %w", ev.Key(), err)
+	}
+	var existing Fingerprint
+	copy(existing[:], fp)
+	if existing == ev.Fingerprint {
+		return Result{Outcome: Duplicate, Position: pos, Existing: existing}, nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO event_conflicts
+		(device_id, boot_id, event_id, fingerprint, packet, first_seen_ns, last_seen_ns, receipts)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+		ON CONFLICT (device_id, boot_id, event_id, fingerprint) DO UPDATE SET
+			receipts      = receipts + 1,
+			first_seen_ns = min(first_seen_ns, excluded.first_seen_ns),
+			last_seen_ns  = max(last_seen_ns, excluded.last_seen_ns)`,
+		string(smp.DeviceID), int64(smp.BootID), int64(smp.EventID), ev.Fingerprint[:], ev.Packet, ing.UnixNano(), ing.UnixNano(),
+	); err != nil {
+		return Result{}, fmt.Errorf("eventstore: record conflict %s: %w", ev.Key(), err)
+	}
+	return Result{Outcome: Conflict, Position: pos, Existing: existing}, nil
 }
 
 // maxReportedBoots bounds Result.EventIDAlsoInBoots.
