@@ -51,7 +51,9 @@ func (t *UDPTransport) Send(p []byte) error {
 }
 
 // LocalAddr is the device's socket address.
-func (t *UDPTransport) LocalAddr() netip.AddrPort { return t.conn.LocalAddr().(*net.UDPAddr).AddrPort() }
+func (t *UDPTransport) LocalAddr() netip.AddrPort {
+	return t.conn.LocalAddr().(*net.UDPAddr).AddrPort()
+}
 
 // Close closes the socket (Receive returns).
 func (t *UDPTransport) Close() error { return t.conn.Close() }

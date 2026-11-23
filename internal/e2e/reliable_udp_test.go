@@ -156,7 +156,9 @@ func TestReliableEndToEndOverUDP(t *testing.T) {
 		wg.Wait() // device loops, receivers, dispatcher and alert loop have stopped
 		for _, d := range devs {
 			d.tr.Close()
-			d.dev.Close()
+			if err := d.dev.Close(); err != nil {
+				t.Errorf("close device %s: %v", d.id, err)
+			}
 		}
 	}()
 
