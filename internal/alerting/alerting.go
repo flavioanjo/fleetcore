@@ -8,7 +8,9 @@
 //   - open: the critical event is durably stored (the device has, or will
 //     get, its ACK). Nobody has been told yet.
 //   - notified: Sink.Notify returned nil (at-least-once; the sink must
-//     deduplicate by Alert.ID).
+//     deduplicate by Alert.ID). This means exactly what the sink
+//     guarantees and no more: with [LogSink] it means a log line was
+//     written, and no person has been told anything.
 //   - acknowledged: an operator explicitly took ownership. Only this state
 //     means "handled"; neither the device ACK nor the notification does.
 package alerting
@@ -385,9 +387,17 @@ func (c *Consumer) List(ctx context.Context, limit int) ([]Entry, error) {
 	return out, rows.Err()
 }
 
-// LogSink is a Sink that writes alerts to a logger (the reference
-// integration point; a deployment replaces it with its incident system).
+// LogSink is a demonstration Sink that writes alerts to a logger. It is
+// NOT an emergency notification service: a successful Notify means only
+// that a log line was written; it does not page, call or otherwise reach a
+// person, and nobody is guaranteed to read the log. A deployment must
+// replace it with an incident-management integration that has its own
+// delivery guarantees and escalation (see README.md, "Deployment
+// blockers").
 type LogSink struct{ Logger *slog.Logger }
+
+// LogSinkNotice is logged by servers that use LogSink.
+const LogSinkNotice = "alert sink is LogSink (demonstration): critical alerts are only written to this log; no person is notified"
 
 // Notify implements Sink.
 func (s LogSink) Notify(_ context.Context, a Alert) error {
@@ -395,6 +405,6 @@ func (s LogSink) Notify(_ context.Context, a Alert) error {
 	if a.Panic != nil && a.Panic.HasPosition {
 		attrs = append(attrs, "lat_e7", a.Panic.Position.LatE7, "lon_e7", a.Panic.Position.LonE7, "position_age", a.Panic.PositionAge)
 	}
-	s.Logger.Warn("CRITICAL EVENT — needs operator acknowledgement (stored and notified; not handled)", attrs...)
+	s.Logger.Warn("CRITICAL EVENT — written to the log only (demo LogSink: no person notified); needs operator acknowledgement", attrs...)
 	return nil
 }

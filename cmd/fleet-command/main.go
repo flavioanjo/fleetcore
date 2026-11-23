@@ -2,17 +2,23 @@
 // inspects their lifecycle and critical-event alerts.
 //
 //	fleet-command keygen  -dir ./data -devices TRK-1,TRK-2
-//	fleet-command request -data ./data -principal ops:alice -roles security_operator \
+//	fleet-command request -data ./data -unverified-demo-identity -principal ops:alice -roles security_operator \
 //	    -device TRK-1 -type BLOCK -ttl 2m -reason "stolen vehicle report 123"
 //	fleet-command show    -data ./data -id COMMAND_ID
 //	fleet-command list    -data ./data [-device TRK-1] [-attention]
 //	fleet-command alerts  -data ./data
-//	fleet-command ack     -data ./data -device TRK-1 -uid 42 -operator ops:dave -note "driver reached"
+//	fleet-command ack     -data ./data -unverified-demo-identity -device TRK-1 -uid 42 -operator ops:dave -note "driver reached"
 //
-// The principal and roles flags stand in for an authenticated operator
-// identity, which a production deployment takes from its identity
-// provider. Commands are signed with the authority key in
-// DATA/authority.json.
+// DEMONSTRATION ONLY. The -principal/-roles (request) and -operator (ack)
+// flags are claims typed on the command line: nothing authenticates them,
+// so anyone who can run this tool against the data directory can claim any
+// role, including security_operator. They stand in for the identity a
+// production deployment must take from an identity provider (with dual
+// control for actuations). The tool therefore refuses request and ack
+// unless -unverified-demo-identity is given, and marks every identity it
+// uses as unverified. Commands are signed with the authority key in
+// DATA/authority.json, which proves only that they passed this tool's
+// policy check, not who asked. See README.md, "Deployment blockers".
 package main
 
 import (
@@ -64,9 +70,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		comp := fs.Int("compartment", 1, "OPEN_CARGO compartment (1-4)")
 		maxAge := fs.Duration("max-age", time.Minute, "REQUEST_POSITION: oldest acceptable fix")
 		reqID := fs.String("request-id", "", "idempotency key (default random); repeat it to retry safely")
+		demo := fs.Bool("unverified-demo-identity", false, demoFlagHelp)
 		if fs.Parse(args[1:]) != nil {
 			return 2
 		}
+		if !*demo {
+			fmt.Fprintln(stderr, demoRefusal)
+			return 2
+		}
+		fmt.Fprintf(stderr, "WARNING: identity %q with roles %q is UNVERIFIED (taken from the command line; demonstration only)\n", *principal, *roles)
 		err = request(ctx, stdout, *data, *principal, *roles, *dev, *typ, *ttl, *reason, *comp, *maxAge, *reqID)
 	case "show":
 		id := fs.String("id", "", "command id")
@@ -86,8 +98,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		uid := fs.Uint64("uid", 0, "event uid (ack)")
 		op := fs.String("operator", "", "acknowledging operator (ack)")
 		note := fs.String("note", "", "note (ack)")
+		demo := fs.Bool("unverified-demo-identity", false, demoFlagHelp+" (ack)")
 		if fs.Parse(args[1:]) != nil {
 			return 2
+		}
+		if args[0] == "ack" {
+			if !*demo {
+				fmt.Fprintln(stderr, demoRefusal)
+				return 2
+			}
+			fmt.Fprintf(stderr, "WARNING: operator %q is UNVERIFIED (taken from the command line; demonstration only)\n", *op)
 		}
 		err = alerts(ctx, stdout, *data, args[0] == "ack", *dev, *uid, *op, *note)
 	default:
@@ -100,6 +120,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	return 0
 }
+
+const demoFlagHelp = "acknowledge that the identity flags are unauthenticated claims (demonstration only; never in production)"
+
+const demoRefusal = `fleet-command: refusing: operator identities and roles given on the command line are not authenticated.
+This tool is a demonstration. Pass -unverified-demo-identity to proceed in a demo or test environment.
+A deployment must authenticate operators through an identity provider (see README.md, "Deployment blockers").`
 
 func keygen(w io.Writer, dir, devs string) error {
 	if devs == "" {
@@ -175,7 +201,8 @@ func request(ctx context.Context, w io.Writer, data, principal, roles, dev, typ 
 	if !created {
 		verb = "already exists (same request id)"
 	}
-	fmt.Fprintf(w, "command %s %s: %s for %s, expires %s, state %s\n", c.ID, verb, c.Type, c.DeviceID, c.ExpiresAt.Format(time.RFC3339), c.State)
+	fmt.Fprintf(w, "command %s %s: %s for %s, expires %s, state %s, requested by %s (unverified demo identity)\n",
+		c.ID, verb, c.Type, c.DeviceID, c.ExpiresAt.Format(time.RFC3339), c.State, c.Principal)
 	return nil
 }
 
@@ -242,15 +269,17 @@ func alerts(ctx context.Context, w io.Writer, data string, ack bool, dev string,
 		if err := c.Acknowledge(ctx, dev, uid, op, note); err != nil {
 			return err
 		}
-		fmt.Fprintf(w, "alert %s/%d acknowledged by %s\n", dev, uid, op)
+		fmt.Fprintf(w, "alert %s/%d acknowledged by %s (unverified demo identity)\n", dev, uid, op)
 		return nil
 	}
 	l, err := c.List(ctx, 1000)
 	if err != nil {
 		return err
 	}
+	fmt.Fprintln(w, `note: "notified" means the server's alert sink accepted the alert. With the default demo sink (LogSink)`)
+	fmt.Fprintln(w, `      that is a line in the server log: no person was notified. Only "acknowledged" means an operator took ownership.`)
 	for _, e := range l {
-		fmt.Fprintf(w, "%s/%d  %-18s %-12s notified=%s acked_by=%s\n", e.DeviceID, e.UID, e.Type, e.State,
+		fmt.Fprintf(w, "%s/%d  %-18s %-12s sink_accepted=%s acked_by=%s\n", e.DeviceID, e.UID, e.Type, e.State,
 			e.NotifiedAt.Format(time.RFC3339), e.AckedBy)
 	}
 	return nil

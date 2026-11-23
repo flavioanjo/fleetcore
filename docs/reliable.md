@@ -302,13 +302,13 @@ fleet-command keygen -dir data -devices TRK-1
 fleet-server -listen 127.0.0.1:7500,127.0.0.1:7501 -data data -keys data/keys.json -authority data/authority.json
 fleet-device -id TRK-1 -keys data/keys.json -authority-pub data/authority.pub -gateway 127.0.0.1:7500 \
     -db data/device-TRK-1.db -fix=-23.55052,-46.63331 -panic-after 2s -offline-for 4s
-fleet-command request -data data -principal ops:alice -roles security_operator -device TRK-1 -type BLOCK -reason "theft report"
-fleet-command request -data data -principal ops:carol -roles fleet_viewer -device TRK-1 -type REQUEST_POSITION
-fleet-command request -data data -principal ops:bob -roles cargo_operator -device TRK-1 -type OPEN_CARGO -reason delivery
+fleet-command request -data data -unverified-demo-identity -principal ops:alice -roles security_operator -device TRK-1 -type BLOCK -reason "theft report"
+fleet-command request -data data -unverified-demo-identity -principal ops:carol -roles fleet_viewer -device TRK-1 -type REQUEST_POSITION
+fleet-command request -data data -unverified-demo-identity -principal ops:bob -roles cargo_operator -device TRK-1 -type OPEN_CARGO -reason delivery
 fleet-command list -data data
 fleet-command show -data data -id <command id>
 fleet-command alerts -data data
-fleet-command ack -data data -device TRK-1 -uid <panic uid> -operator ops:dave -note "driver contacted"
+fleet-command ack -data data -unverified-demo-identity -device TRK-1 -uid <panic uid> -operator ops:dave -note "driver contacted"
 ```
 
 `fleet-command show` prints the full history, e.g.:
@@ -383,14 +383,46 @@ fleet-command ack -data data -device TRK-1 -uid <panic uid> -operator ops:dave -
   (not timestamps: two requests in one millisecond kept random order).
 - **ADR-R10 Alerts need a human.** Notification is at-least-once to a
   `Sink`; only an operator acknowledgement marks a critical event handled.
-  No emergency dispatch is invented.
+  No emergency dispatch is invented. "Notified" means what the sink
+  guarantees: with the demonstration `LogSink` only that a log line was
+  written (the server says so at startup and `fleet-command alerts` says so
+  above its list).
+- **ADR-R11 Supervised services; orderly stop finishes work in progress.**
+  `fleet-server` runs the gateways, the dispatcher and the alerting consumer
+  under a supervisor: any of them stopping on its own (error, panic, return
+  without a stop request) stops the whole server with exit status 1 and the
+  failed service named; a server never keeps running with command delivery
+  or alert processing stopped. The dispatcher and the alerting consumer
+  return `ErrFailed` after 25 consecutive failed iterations instead of
+  logging forever. A stop request is honoured between iterations: a
+  delivery between its write-ahead record and its outcome, a notification
+  the sink accepted, and (on the device) an actuation's outcome commit are
+  never interrupted, so an orderly stop cannot produce a false `unknown`.
+  Stores are closed only after every service returned; a service that does
+  not return within `-shutdown-grace` leaves the stores to the process exit
+  (exit 1) rather than having them closed under it.
+- **ADR-R12 Queries run without context cancellation.** modernc.org/sqlite
+  v1.38.2 leaks a prepared statement when a query's context is cancelled
+  while it steps to the first row; the interrupted connection is then
+  dropped by `database/sql` and becomes a zombie that keeps the file and a
+  read snapshot open (WAL checkpoints blocked; on Windows the file cannot be
+  deleted). This was the cause of the intermittent `TestServerStartsAndStops`
+  failures. `internal/sqlitedb` wraps the driver and passes queries a
+  context without cancellation (a context cancelled before the query is
+  still refused; row iteration still observes cancellation). Exec and
+  transactions keep cancellation. Regression:
+  `TestCancelledQueryReleasesConnection`. *Alternative*: upgrading the
+  driver once a fixed release is verified; the wrapper stays harmless.
 
 ## 9. Known limitations
 
 - No confidentiality (see ADR-R2). Positions and commands are readable on
   the wire.
-- Principal authentication is delegated to the caller (CLI flags stand in
-  for an identity provider); no dual control for actuations.
+- Principal authentication is delegated to the caller: `fleet-command`'s
+  identity flags are unauthenticated claims (the tool refuses to use them
+  without `-unverified-demo-identity`); no dual control for actuations.
+- The only alert sink is the demonstration `LogSink`: no person is
+  notified of a PANIC.
 - Device time integrity is assumed for command expiry/freshness.
 - A TELEMETRY event inherits the version-1 domain rule that device time may
   be at most 5 minutes after the ingestion time. A device whose clock runs
@@ -408,6 +440,24 @@ fleet-command ack -data data -device TRK-1 -uid <panic uid> -operator ops:dave -
 - Retention of server-side reliable events, conflicts, attempts and history
   is unbounded (append-only audit); deployments need an archival policy.
 - On Windows, a test's temporary-directory cleanup occasionally fails
-  because a just-closed SQLite file is still held by the OS (issue #5); it
-  happened once in this work, under `-race` with the whole suite in
-  parallel, after all assertions passed.
+  because a SQLite file is still held (issue #5, v1 packages). The failures
+  seen in `cmd/fleet-server` during this work were not that issue but the
+  driver defect of ADR-R12, now fixed and covered by tests.
+
+## 10. Deployment blockers and mandatory controls
+
+This implementation is a demonstration with simulated actuators. Before it
+handles real data, and in any case before any real immobilizer or cargo
+actuation is integrated, the following are mandatory; none of them is
+implemented here.
+
+| Blocker | Today | Required |
+|---|---|---|
+| Operator identity | `-principal`/`-roles`/`-operator` typed on the CLI; unauthenticated; refused without `-unverified-demo-identity` | authentication through an identity provider (MFA), roles from a managed directory, the authenticated identity bound into the audit record and the signed command |
+| Authorization of actuations | one operator with the role suffices | dual control (two distinct authenticated operators) for BLOCK, UNBLOCK and OPEN_CARGO; rate limits; a break-glass procedure with review |
+| Emergency notification | `LogSink`: a log line; nobody is paged | an incident-management integration with delivery confirmation, escalation and on-call coverage; monitoring of open, unacknowledged PANIC alerts |
+| Confidentiality | payloads authenticated, not encrypted (positions and commands readable on the wire) | AEAD on the v2 payload (as a new protocol version) or a confidential transport |
+| Key custody | device keys and the authority key in local files (0600) | device keys in a secure element; the authority key in an HSM with audited use; rotation and revocation procedures |
+| Audit retention | unbounded, local | a retention and archival policy; tamper-evident export |
+| Physical safety | simulated interlocks (speed, ignition, sensor confirmation) | independent safety engineering of the vehicle integration (hazard analysis, a functional-safety process, hardware interlocks that do not depend on this software), hardware-in-the-loop validation, a field-test authorization |
+| Operations | process exit status and logs | a process supervisor that restarts on exit status 1; alerting on service failure and on growing queues |

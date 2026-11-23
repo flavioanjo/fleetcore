@@ -134,7 +134,8 @@ go run ./cmd/fleet-reliable-demo                       # narrated, deterministic
 go run ./cmd/fleet-command keygen -dir data -devices TRK-1
 go run ./cmd/fleet-server -listen 127.0.0.1:7500 -data data -keys data/keys.json -authority data/authority.json &
 go run ./cmd/fleet-device -id TRK-1 -keys data/keys.json -authority-pub data/authority.pub     -gateway 127.0.0.1:7500 -db data/device-TRK-1.db -panic-after 3s &
-go run ./cmd/fleet-command request -data data -principal ops:alice -roles security_operator     -device TRK-1 -type BLOCK -reason "theft report"
+go run ./cmd/fleet-command request -data data -unverified-demo-identity -principal ops:alice -roles security_operator \
+    -device TRK-1 -type BLOCK -reason "theft report"
 go run ./cmd/fleet-command list -data data
 ```
 
@@ -147,8 +148,35 @@ go run ./cmd/fleet-command list -data data
   failed, rejected, expired or **unknown** — never guessed.
 - **A PANIC is handled only when an operator acknowledges it**; storage and
   notification are earlier, separate states.
+- **Supervised server.** If a gateway, the dispatcher or the alerting
+  consumer stops, `fleet-server` stops and exits 1 naming it; on
+  SIGINT/SIGTERM it finishes work in progress and exits 0.
 - **Simulated actuators only.** Real vehicle actuation needs independent
   safety engineering and hardware validation (see docs/reliable.md).
+
+### Deployment blockers (demonstration-only behaviour)
+
+This is not deployable as is. In particular:
+
+- **Operator identities are not authenticated.** `fleet-command` takes the
+  principal, roles and acknowledging operator from its flags; anyone who can
+  run it can claim `security_operator`. It refuses `request` and `ack`
+  unless `-unverified-demo-identity` is given, and labels every such
+  identity as unverified. A signed command proves only that the request
+  passed the policy check, not who made it.
+- **No person is notified of a PANIC.** The only alert sink, `LogSink`,
+  writes a log line. An alert in state `notified` means "the sink accepted
+  it", which for `LogSink` is that log line.
+- **Payloads are authenticated, not encrypted.** Positions and commands are
+  readable on the network.
+- **Keys are local files.** Device keys and the command authority's private
+  key are files on disk (0600), not in a secure element or HSM.
+
+The controls required before any real-world immobilizer or cargo actuation
+(an identity provider and dual control, a real incident-notification
+integration, confidentiality, HSM/secure-element key custody, independent
+safety engineering and hardware validation) are listed in
+[docs/reliable.md §10](docs/reliable.md#10-deployment-blockers-and-mandatory-controls).
 
 ## Requirements
 

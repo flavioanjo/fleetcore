@@ -195,6 +195,7 @@ func run(ctx context.Context, args []string, stderr io.Writer, ready chan<- []st
 		}
 	}
 
+	log.Warn(alerting.LogSinkNotice)
 	log.Info("fleet-server ready", "gateways", addrs, "data", *data, "authority_key_id", auth.KeyID())
 	if ready != nil {
 		ready <- addrs

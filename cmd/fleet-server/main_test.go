@@ -137,6 +137,9 @@ func TestServerStartsAndStops(t *testing.T) {
 	if code := s.wait(t); code != 0 {
 		t.Fatalf("exit %d: %s", code, s.log.String())
 	}
+	if !strings.Contains(s.log.String(), "no person is notified") {
+		t.Fatalf("demo alert sink not announced: %s", s.log.String())
+	}
 	if !strings.Contains(s.log.String(), "status=ok") {
 		t.Fatalf("no final status: %s", s.log.String())
 	}
