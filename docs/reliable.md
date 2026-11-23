@@ -6,6 +6,14 @@ lifecycle to the existing UDP ingestion, event store, chronological
 processing and fusion pipeline. The wire format is
 [protocol-v2.md](protocol-v2.md). Version 1 ingestion is unchanged.
 
+> **Status: experimental. Simulated actuators only. Not authorized for real
+> vehicles.** This subsystem is experimental software. It uses exclusively
+> simulated actuators, and the project does not authorize its use to control
+> immobilizers (vehicle blocking), cargo locks or any other actuator of a real
+> vehicle. This statement describes the project's status; it is not an
+> additional term of the Apache-2.0 license, under which the software is
+> provided without warranty or liability (sections 7 and 8).
+>
 > **Safety notice.** All actuators in this project are simulated
 > (`internal/simhw`). Nothing here drives real relays, ignition circuits,
 > immobilizers or locks. Production vehicle actuation requires independent
@@ -198,6 +206,11 @@ already_in_state with no actuation.
   the transport key alone cannot authorize an actuation.
 
 ## 4. Authentication and threat model
+
+Scope: this threat model covers an experimental system with simulated
+actuators. It is not a safety case, and the project does not authorize the
+system to control the immobilizer, locks or any other actuator of a real
+vehicle (see the status statement at the top and §10).
 
 | Threat | Defence | Residual |
 |---|---|---|
@@ -484,10 +497,11 @@ fleet-command ack -data data -unverified-demo-identity -device TRK-1 -uid <panic
 
 ## 10. Deployment blockers and mandatory controls
 
-This implementation is a demonstration with simulated actuators. Before it
-handles real data, and in any case before any real immobilizer or cargo
-actuation is integrated, the following are mandatory; none of them is
-implemented here.
+This implementation is experimental and uses simulated actuators only; the
+project does not authorize it to control the immobilizer, locks or any other
+actuator of a real vehicle. Before it handles real data, and in any case
+before any real immobilizer or cargo actuation is integrated, the following
+are mandatory; none of them is implemented here.
 
 | Blocker | Today | Required |
 |---|---|---|
