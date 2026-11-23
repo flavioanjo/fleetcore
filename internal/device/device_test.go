@@ -359,3 +359,67 @@ func TestBackoffIsBoundedAndCriticalNeverExpires(t *testing.T) {
 		t.Fatalf("critical event %s once ACKs get through (critical events never expire)", r.state(p))
 	}
 }
+
+// Regression: the v1 telemetry sequence used to advance inside the body
+// builder, before the capacity check, the encoding and the commit, so
+// every rejected enqueue left a gap in the transmitted sequence. Only a
+// durably queued sample may consume a sequence number.
+func TestTelemetrySequenceAdvancesOnlyOnDurableEnqueue(t *testing.T) {
+	failCommit := false
+	r := newRig(t, func(c *device.Config) {
+		c.Capacity, c.CriticalReserve = 5, 1 // routine limit 4; boot queues 2 state reports
+		c.InitialSequence = ^telemetry.Sequence(0) - 1
+		c.Hooks = &device.Hooks{BeforeEnqueueCommit: func() error {
+			if failCommit {
+				return errors.New("storage failure")
+			}
+			return nil
+		}}
+	})
+	ctx := context.Background()
+	good := func() telemetry.Sample {
+		return telemetry.Sample{Source: telemetry.SourceGPS, Quality: telemetry.QualityGood,
+			Distance: telemetry.Some(telemetry.Distance{Kind: telemetry.DistanceDelta, Value: 100})}
+	}
+	mustQueue := func(what string) {
+		t.Helper()
+		if _, err := r.dev.EnqueueTelemetry(ctx, good()); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	mustQueue("first sample")
+	bad := good()
+	bad.Source = telemetry.Source(250) // invalid body: rejected by the encoder
+	if _, err := r.dev.EnqueueTelemetry(ctx, bad); err == nil {
+		t.Fatal("invalid sample queued")
+	}
+	mustQueue("after an invalid body")
+	if _, err := r.dev.EnqueueTelemetry(ctx, good()); !errors.Is(err, device.ErrQueueFull) {
+		t.Fatalf("full queue: %v", err)
+	}
+	r.exchange(false) // drains the queue
+	failCommit = true
+	if _, err := r.dev.EnqueueTelemetry(ctx, good()); err == nil {
+		t.Fatal("enqueue succeeded although its commit failed")
+	}
+	failCommit = false
+	mustQueue("retry after the failed commit") // crosses the 2^32 wrap
+	mustQueue("after the wrap")
+	r.clk.advance(time.Second)
+	r.exchange(false)
+
+	recs, err := r.events.ReadAfter(ctx, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	max := ^telemetry.Sequence(0)
+	want := []telemetry.Sequence{max - 1, max, 0, 1}
+	if len(recs) != len(want) {
+		t.Fatalf("%d samples stored, want %d", len(recs), len(want))
+	}
+	for i, rec := range recs {
+		if rec.Sample.Sequence != want[i] {
+			t.Fatalf("sample %d has sequence %d, want %d (a rejected enqueue left a gap)", i, rec.Sample.Sequence, want[i])
+		}
+	}
+}

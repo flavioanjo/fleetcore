@@ -306,22 +306,29 @@ func (d *Device) enqueue(ctx context.Context, build func(uid uint64, now time.Ti
 
 // EnqueueTelemetry queues a v1 telemetry sample; its DeviceID, EventID
 // (= UID), BootID (= session generation, low 32 bits) and Sequence are set
-// by the device.
+// by the device. The sequence number is consumed only when the sample is
+// durably queued: a full queue, an invalid sample or a failed commit leaves
+// no gap in the transmitted sequence.
 func (d *Device) EnqueueTelemetry(ctx context.Context, s telemetry.Sample) (uint64, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.enqueue(ctx, func(uid uint64, now time.Time) (reliable.Body, error) {
+	seq := d.sequence
+	uid, err := d.enqueue(ctx, func(uid uint64, now time.Time) (reliable.Body, error) {
 		s.DeviceID, s.EventID = telemetry.DeviceID(d.cfg.DeviceID), telemetry.EventID(uid)
 		s.BootID = telemetry.BootID(uint32(d.gen))
 		if s.BootID == 0 {
 			s.BootID = 1 // the low 32 bits wrapped to the reserved value
 		}
-		s.Sequence = d.sequence
+		s.Sequence = seq
 		s.DeviceTime = time.UnixMilli(now.UnixMilli()).UTC()
 		s.IngestedAt = telemetry.None[time.Time]()
-		d.sequence++ // wraps at 2^32, as the v1 domain allows
 		return reliable.Telemetry{Sample: s}, nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	d.sequence = seq + 1 // after the commit; wraps at 2^32, as the v1 domain allows
+	return uid, nil
 }
 
 // ReadPosition reads the GNSS and remembers the fix if valid.
