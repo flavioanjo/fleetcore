@@ -29,24 +29,34 @@ func registerDriver() {
 	})
 }
 
-// safeDriver works around a resource leak in modernc.org/sqlite (observed
-// in v1.38.2): when a query's context is cancelled while sqlite3_step is
-// producing its first row, stmt.query drops the rows it has just built
-// without finalizing the prepared statement and returns ctx.Err(). The
-// connection is marked interrupted, so database/sql discards it, and
-// sqlite3_close_v2 with an unfinalized statement leaves a zombie that keeps
-// the database file open and holds a read snapshot: Close reports success,
-// WAL checkpoints are blocked for good, and on Windows the file stays
-// locked (TestCancelledQueryReleasesConnection).
+// safeDriver works around a resource leak in modernc.org/sqlite v1.38.2
+// (fixed upstream in v1.40.1, which requires Go 1.24; this module supports
+// Go 1.23, and v1.39.0, the last release for Go 1.23, still has it): when a
+// query's context is cancelled while sqlite3_step is producing its first
+// row, stmt.query drops the rows it has just built without finalizing the
+// prepared statement and returns ctx.Err(). The connection is marked
+// interrupted, so database/sql discards it, and sqlite3_close_v2 with an
+// unfinalized statement leaves a zombie that keeps the database file open
+// and holds a read snapshot: Close reports success, WAL checkpoints are
+// blocked for good, and on Windows the file stays locked
+// (TestCancelledQueryReleasesConnection).
 //
 // safeDriver passes queries to the driver without the context's
-// cancellation. A query that has started therefore runs to its first row
-// (bounded by busy_timeout and by the size of FleetCore's queries); a
-// context cancelled earlier is still refused, and database/sql still
-// observes the original context while the rows are iterated (it closes
-// them, finalizing the statement properly, and Rows.Err reports the
-// cancellation). Exec and transactions keep full cancellation: the
-// driver's exec path finalizes its statement in every case.
+// cancellation. A context already cancelled or expired is refused before
+// the query starts, and database/sql still observes the original context
+// while rows are iterated (it closes them, finalizing the statement
+// properly, and Rows.Err reports the cancellation). Exec and transactions
+// keep full cancellation: the driver's exec path finalizes its statement in
+// every case.
+//
+// LIMITATION: a deadline or cancellation that arrives while a query is
+// executing, before its first row, does not stop it; the query runs until
+// it produces its first row or ends (TestQueryDeadlineDuringExecution).
+// busy_timeout does not bound this: it only bounds waiting for a lock.
+// FleetCore's queries are fixed, parameterized, indexed and LIMITed, so in
+// normal operation they take milliseconds; the operational policy for the
+// rest is in docs/reliable.md (ADR-R12). Remove this wrapper when the
+// driver is upgraded to a fixed release.
 type safeDriver struct{ inner driver.Driver }
 
 func (d safeDriver) Open(name string) (driver.Conn, error) {

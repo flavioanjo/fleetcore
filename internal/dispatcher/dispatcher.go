@@ -56,9 +56,11 @@ type Config struct {
 	Batch int
 	// Interval is the Run loop period. Default 200ms.
 	Interval time.Duration
-	// IterationTimeout bounds one Run iteration (apply reports, then one
-	// dispatch step). Iterations are not interrupted by a stop request; this
-	// bound keeps a stuck store from delaying shutdown forever. Default 30s.
+	// IterationTimeout is the deadline of one Run iteration (apply reports,
+	// then one dispatch step); iterations are not interrupted by a stop
+	// request. It cancels lock waits, writes and transactions, and stops
+	// row iteration, but not a read query that is executing before its
+	// first row (internal/sqlitedb, ADR-R12). Default 30s.
 	IterationTimeout time.Duration
 	// MaxConsecutiveFailures is how many Run iterations in a row may fail
 	// before Run gives up and returns ErrFailed. Default 25 (about 5s of
@@ -239,7 +241,7 @@ func (d *Dispatcher) Apply(ctx context.Context) (int, error) {
 // returns nil.
 //
 // A stop request (ctx cancelled) is honoured between iterations. The
-// iteration in progress completes, bounded by IterationTimeout: in
+// iteration in progress completes, under IterationTimeout: in
 // particular a delivery between its write-ahead record ("sending") and its
 // outcome is never interrupted, so an orderly shutdown cannot make a
 // command's outcome falsely unknown.

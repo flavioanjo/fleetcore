@@ -94,8 +94,10 @@ type Config struct {
 	Batch                      int
 	// Interval is the Run loop period. Default 200ms.
 	Interval time.Duration
-	// StepTimeout bounds one Run step (including Sink.Notify). Steps are not
-	// interrupted by a stop request. Default 30s.
+	// StepTimeout is the deadline of one Run step, passed to Sink.Notify and
+	// to the stores; steps are not interrupted by a stop request. It does
+	// not stop a read query that is executing before its first row
+	// (internal/sqlitedb, ADR-R12). Default 30s.
 	StepTimeout time.Duration
 	// MaxConsecutiveFailures is how many Run steps in a row may fail before
 	// Run returns ErrFailed. Default 25.
@@ -156,7 +158,7 @@ func (c *Consumer) Close() error { return c.db.Close() }
 
 // Run calls Step every Interval until ctx is cancelled; it then returns
 // nil. A stop request is honoured between steps: the step in progress
-// completes (bounded by StepTimeout), so a notification the sink accepted
+// completes (under StepTimeout), so a notification the sink accepted
 // is recorded as such rather than repeated after a restart. Run returns an
 // error wrapping ErrFailed after MaxConsecutiveFailures failed steps.
 func (c *Consumer) Run(ctx context.Context) error {

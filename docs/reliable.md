@@ -408,11 +408,47 @@ fleet-command ack -data data -unverified-demo-identity -device TRK-1 -uid <panic
   read snapshot open (WAL checkpoints blocked; on Windows the file cannot be
   deleted). This was the cause of the intermittent `TestServerStartsAndStops`
   failures. `internal/sqlitedb` wraps the driver and passes queries a
-  context without cancellation (a context cancelled before the query is
-  still refused; row iteration still observes cancellation). Exec and
-  transactions keep cancellation. Regression:
-  `TestCancelledQueryReleasesConnection`. *Alternative*: upgrading the
-  driver once a fixed release is verified; the wrapper stays harmless.
+  context without cancellation (a context already cancelled or expired is
+  refused before the query starts; row iteration still observes
+  cancellation). Exec and transactions keep cancellation. Regression:
+  `TestCancelledQueryReleasesConnection`.
+
+  **Cost (confirmed):** a deadline or cancellation that arrives while a
+  read query is executing, before its first row, does not stop it
+  (`TestQueryDeadlineDuringExecution`: with the same 100 ms deadline the
+  unwrapped driver interrupts the query; through the wrapper it is still
+  running 2 s later and ends only when the query itself ends).
+  `busy_timeout` does not bound this; it only bounds waiting for a lock.
+  `IterationTimeout`/`StepTimeout` bound lock waits, writes, transactions
+  and row iteration, not such a query.
+
+  **Options evaluated:**
+
+  | Option | Statement release | Deadline during execution | Go 1.23 | Verdict |
+  |---|---|---|---|---|
+  | v1.38.2 unwrapped | leaks (zombie connection) | yes | yes | rejected |
+  | v1.38.2 + wrapper (current) | correct | no | yes | kept, with the policy below |
+  | v1.39.0 (last release for Go 1.23) | leaks (same code) | yes | yes | no fix |
+  | v1.40.1+ (first fixed release) without the wrapper | correct | yes | **no: requires Go 1.24** | best fix; needs the maintainers' decision to raise the minimum Go version. Verified in a throwaway copy: leak test 10/10, deadline honoured, full suite and server shutdown tests pass, `go build` with Go 1.23.0 refused |
+  | patched fork of v1.38.2 (`replace`) | correct | yes | yes | rejected: maintaining a fork of a large generated module |
+  | own interrupt on deadline | — | — | — | not possible: the driver exposes no interrupt; closing a connection in use is not acceptable |
+
+  **Operational policy while the wrapper is in place:**
+  1. Only the fixed, parameterized queries of the store packages run
+     against live databases; each reads by primary key or index and is
+     LIMITed (batch sizes in §6). No ad-hoc or user-supplied SQL. A new
+     query is reviewed with `EXPLAIN QUERY PLAN` (no full scan of a growing
+     table).
+  2. Table growth is bounded by the retention policy that deployment
+     requires anyway (§9, §10).
+  3. A query that never ends shows up as a service that stops progressing.
+     On stop, `fleet-server` waits at most `-shutdown-grace`, then exits 1
+     without closing the stores under it; the process supervisor restarts
+     it (SQLite commits are durable). Deployments monitor progress (stored
+     events, dispatcher iterations) and alert when it stalls.
+  4. Removal: raise the minimum Go version to 1.24, upgrade the driver to a
+     fixed release (≥ v1.40.1), delete `internal/sqlitedb/driver.go`, and
+     invert `TestQueryDeadlineDuringExecution`.
 
 ## 9. Known limitations
 
@@ -439,6 +475,8 @@ fleet-command ack -data data -unverified-demo-identity -device TRK-1 -uid <panic
   processes work but each reaches only devices talking to its gateways.
 - Retention of server-side reliable events, conflicts, attempts and history
   is unbounded (append-only audit); deployments need an archival policy.
+- Read queries cannot be cancelled or timed out while executing before
+  their first row (ADR-R12: driver workaround; operational policy there).
 - On Windows, a test's temporary-directory cleanup occasionally fails
   because a SQLite file is still held (issue #5, v1 packages). The failures
   seen in `cmd/fleet-server` during this work were not that issue but the
