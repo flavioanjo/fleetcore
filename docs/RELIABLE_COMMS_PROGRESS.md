@@ -76,3 +76,11 @@ interruption. The final state is summarised at the end.
   stale in-memory session kept sealing deliveries for the device's previous session. Fixed in
   the gateway (deliver only with the latest durable session / most recent gateway);
   deterministic regression test added (failed before, passes after).
+- Soak run 2 (after the routing fix): 2 h simulated, 20 devices, 14 474 events all acknowledged and
+  stored once, 37 commands: 24 succeeded, 13 failed (REQUEST_POSITION without a GNSS fix in the
+  soak's vehicles), 0 unknown; 11 immobilizer drives.
+
+## Final state
+
+All milestones done and committed on `feature/reliable-communications` (not pushed, not merged).
+See the final report in the session and docs/reliable.md for guarantees and known limitations.
