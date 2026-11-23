@@ -324,6 +324,8 @@ fleetcore/
 │   └── reliable.md         reliable communications: design, guarantees, threat model
 ├── .github/workflows/ci.yml
 ├── COPYRIGHT
+├── LICENSE                 Apache License 2.0
+├── NOTICE
 └── go.mod
 ```
 
@@ -353,7 +355,32 @@ for where each piece is expected to fit.
    keys in a secure element / HSM, an identity provider and dual control for
    actuations, retention and archival of the command and event audit trail.
 
-## Copyright
+## License
 
-Copyright (c) 2026 Flavio Anjo. All rights reserved. No license for reuse has
-been granted yet; see [COPYRIGHT](COPYRIGHT).
+Copyright (c) 2026 Flavio Anjo.
+
+FleetCore is licensed under the [Apache License, Version 2.0](LICENSE).
+
+SPDX-License-Identifier: `Apache-2.0`
+
+See [LICENSE](LICENSE) for the full text, [NOTICE](NOTICE) for the
+attribution notice that redistributions must carry, and
+[COPYRIGHT](COPYRIGHT).
+
+Third-party dependencies are not included in this repository; they are
+fetched by the Go toolchain (`go.mod`, `go.sum`) and keep their own
+licenses: `modernc.org/sqlite`, `modernc.org/libc`, `modernc.org/mathutil`,
+`modernc.org/memory`, `golang.org/x/sys`, `golang.org/x/exp` and
+`github.com/remyoudompheng/bigfft` under BSD-3-Clause;
+`github.com/dustin/go-humanize`, `github.com/mattn/go-isatty` and
+`github.com/ncruces/go-strftime` under MIT; `modernc.org/libc` also carries
+musl's MIT license, and `modernc.org/sqlite` is a translation of SQLite,
+which is in the public domain. Binary distributions of the commands include
+these modules and must carry their license notices.
+
+The reliable communications subsystem is **experimental** and uses
+**simulated actuators only**; the project does not authorize it to control
+immobilizers, locks or any other actuator of a real vehicle (see
+[docs/reliable.md](docs/reliable.md)). This is a statement of the project's
+status, not an additional license term; the software is provided without
+warranty or liability as set out in sections 7 and 8 of the License.
