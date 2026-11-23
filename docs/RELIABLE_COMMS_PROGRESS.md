@@ -111,3 +111,34 @@ e2e 10x, simnet 5x, stop-safety 20x, session race 50x pass; six fuzz targets 30 
 `TestConcurrentDevicesOverUDP` timed out under full parallel load in 3 of 3 runs on this branch and
 in 1 of 2 runs on 6a8a229 (passes 10/10 alone on both): pre-existing, not fixed here.
 Cost: batch-64 ingestion about 9% slower (one session lookup per event in the insert transaction).
+
+## Second audit follow-up
+
+**Query deadlines under the driver workaround** (b6f6891). Confirmed: through the wrapper a
+read query executing before its first row ignores its deadline (the unwrapped driver interrupts
+it); `TestQueryDeadlineDuringExecution` characterizes it. No modernc.org/sqlite release for
+Go 1.23 fixes the leak (v1.39.0 still has it); v1.40.1, the first fixed release, requires Go 1.24.
+Verified in a throwaway copy (v1.40.1, wrapper removed): leak test 10/10, deadline honoured,
+suite and server shutdown tests pass, Go 1.23.0 refuses to build. Not applied (minimum Go
+version is the maintainers' decision). Limitation, options and operational policy: docs/reliable.md
+ADR-R12.
+
+**TestConcurrentDevicesOverUDP** (v1 pipeline, 16 devices x 120 events). Instrumented throwaway
+copies recorded settled events every 0.5 s past the former fixed 10 s deadline:
+
+| Condition (`-race`) | HEAD | HEAD without wrapper | 6a8a229 |
+|---|---|---|---|
+| full suite, packages in parallel (3 runs each): settle time | 11.0 / 12.2 / 12.8 s | 12.3 / 11.9 / 12.4 s | 10.7 / 11.0 / 11.1 s |
+| same: longest pause without progress | <= 0.51 s | <= 0.55 s | <= 0.48 s |
+| full suite, one package at a time | 5.8 s | | |
+| test alone (5 runs) | 5.80-5.87 s | | 5.86-5.90 s |
+| test alone + CPU load (12 race-instrumented processes) | 14.7-19.0 s, pause <= 0.78 s | | |
+| test alone + fsync load (6 processes of durable commits) | 6.3-6.5 s, pause <= 0.25 s | | |
+
+Storage progresses continuously; the time is dominated by CPU contention on the
+race-instrumented pipeline, not by disk or locks (StoreRetries and StoreFailed 0 in every run);
+the wrapper adds nothing measurable (identical isolated times, no better without it). The fixed
+10 s deadline was below the healthy settle time under the parallel `-race` suite on this machine
+(all 9 instrumented runs needed more). The wait is now progress-based: fail after 10 s without
+progress (the former total) or 120 s in total; the event count and all integrity assertions are
+unchanged; the policy has its own deterministic test (`TestAwaitProgressPolicy`).

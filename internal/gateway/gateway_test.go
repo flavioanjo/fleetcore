@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -112,11 +113,63 @@ func waitFor(t *testing.T, g *Gateway, what string, cond func(Stats) bool) Stats
 	}
 }
 
+// Settling is judged by progress, not by a fixed total deadline. Under the
+// race detector with the whole suite running in parallel, storing 1920
+// events took 11-13 s while making continuous progress (longest pause
+// about 0.5 s), so the former fixed 10 s deadline failed healthy runs; the
+// cause is CPU contention (the race-instrumented pipeline), not disk or
+// locks (investigation in docs/RELIABLE_COMMS_PROGRESS.md). A pipeline
+// that stops progressing still fails after settleStall, which equals the
+// former total deadline, and every wait is capped at settleLimit.
+const (
+	settleStall = 10 * time.Second
+	settleLimit = 120 * time.Second
+)
+
+// errNoProgress and errSettleLimit are returned by awaitProgress.
+var (
+	errNoProgress  = errors.New("no progress")
+	errSettleLimit = errors.New("absolute limit reached")
+)
+
+// awaitProgress polls poll until it reports done. It fails if the progress
+// counter does not change for stall, or if limit elapses in total. now and
+// sleep are injected so the policy itself is tested deterministically.
+func awaitProgress(poll func() (done bool, progress uint64), stall, limit time.Duration,
+	now func() time.Time, sleep func(time.Duration)) error {
+	start := now()
+	_, last := poll()
+	lastChange := start
+	for {
+		done, p := poll()
+		if done {
+			return nil
+		}
+		t := now()
+		if p != last {
+			last, lastChange = p, t
+		}
+		switch {
+		case t.Sub(start) >= limit:
+			return fmt.Errorf("%w (%v)", errSettleLimit, limit)
+		case t.Sub(lastChange) >= stall:
+			return fmt.Errorf("%w for %v", errNoProgress, stall)
+		}
+		sleep(2 * time.Millisecond)
+	}
+}
+
 func waitSettled(t *testing.T, g *Gateway, received uint64) Stats {
 	t.Helper()
-	return waitFor(t, g, "pipeline to settle", func(s Stats) bool {
-		return s.Received >= received && settled(s) == s.Received
-	})
+	var s Stats
+	err := awaitProgress(func() (bool, uint64) {
+		s = g.Stats()
+		return s.Received >= received && settled(s) == s.Received, settled(s)
+	}, settleStall, settleLimit, time.Now, time.Sleep)
+	if err != nil {
+		t.Fatalf("pipeline did not settle: %v: %+v", err, s)
+	}
+	return s
 }
 
 func simSamples(t *testing.T, vehicles, samples int) []telemetry.Sample {
