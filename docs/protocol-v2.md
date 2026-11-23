@@ -100,7 +100,9 @@ authenticated invalid event with a signed `AckInvalid`.
   (retransmissions get new counters).
 - **Server.** The highest generation seen per device is stored durably in
   the shared event store (`device_sessions`). A frame of a lower generation
-  is rejected by every gateway (stale_session), across restarts. A frame of
+  is rejected by every gateway (stale_session), across restarts; the check is
+  repeated atomically when the event is stored, so an event admitted just
+  before another gateway recorded a newer session is not stored either. A frame of
   a higher generation starts a new session. Within a session each gateway
   keeps a 1024-counter sliding window (RFC 4303 §3.4.3): duplicates and
   counters more than 1023 below the highest are rejected (replay).

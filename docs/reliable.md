@@ -348,6 +348,25 @@ fleet-command ack -data data -device TRK-1 -uid <panic uid> -operator ops:dave -
   (first design) left a window in which a gateway that had not seen a
   reboot accepted old-session frames; the test that exposed it now passes
   without the window.
+- **ADR-R6c Session re-checked inside the insert transaction.** A gateway
+  admits a frame (session and replay checks) and stores its event in two
+  transactions; another gateway can durably record a newer session in
+  between. Reproduced deterministically
+  (`TestReliableSessionAdvancedBetweenAdmitAndCommit`, gateway A's
+  `BeforeCommit` hook makes gateway B record session N+1): before the fix the
+  session-N event was stored and acknowledged after N+1 was recorded. The
+  high-water mark itself was never lowered (the upsert only raises it) and
+  gateway A already refused to seal commands for the superseded session
+  (ADR-R6b), and the event was authentic and seen for the first time, so no
+  state could be forged and no command authorized; but the documented rule
+  "a frame of a lower generation is rejected by every gateway" did not hold
+  at the persistence boundary. `AppendReliable` now compares each event with
+  `device_sessions` in the same `BEGIN IMMEDIATE` transaction (the store has
+  one writer, so the check and the insert are atomic with respect to
+  `ObserveSession`); a superseded event yields `StaleSession`, nothing is
+  written, the gateway answers nothing (stale_session) and the device
+  retransmits the still-pending event in its current session. Cost: one
+  primary-key lookup per event.
 - **ADR-R6b Deliver only through the gateway with the latest view.** A
   gateway seals a delivery only if its remembered session is the device's
   current one in the shared store and no other gateway heard the device more

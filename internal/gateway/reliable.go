@@ -399,6 +399,13 @@ func (r *Reliable) Process(ctx context.Context, batch []Prepared) []Outbound {
 		case eventstore.Duplicate:
 			a.Status, a.Position = reliable.AckDuplicate, res.Position
 			r.stats.Duplicates.Add(1)
+		case eventstore.StaleSession:
+			// Another gateway recorded a newer session between this frame's
+			// admission and its commit: treated exactly like a frame that was
+			// stale on arrival (no answer; the device retransmits the event
+			// in its current session).
+			r.reject(&reliable.Error{Code: reliable.CodeStaleSession, Detail: "session superseded before commit"})
+			continue
 		default:
 			a.Status = reliable.AckConflict
 			r.stats.Conflicts.Add(1)

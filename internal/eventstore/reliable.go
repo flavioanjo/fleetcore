@@ -104,6 +104,16 @@ const (
 // AppendReliable classifies and stores v2 events in one transaction:
 // either every result is durable when it returns nil, or nothing was
 // written.
+//
+// Each event's session is re-checked inside the transaction against the
+// device's durable high-water mark (device_sessions): an event whose
+// generation is lower, or equal with another key version, is not written
+// and yields [StaleSession]. A gateway admits a frame and stores it in
+// separate transactions, so another gateway may record a newer session in
+// between; this check makes "no event of a superseded session is stored
+// after the newer session was recorded" hold at the persistence boundary.
+// A device without a recorded session (the gateway always records one
+// before admitting a frame) is not checked.
 func (s *Store) AppendReliable(ctx context.Context, evs []ReliableEvent) ([]ReliableResult, error) {
 	if len(evs) == 0 {
 		return nil, nil
@@ -143,6 +153,15 @@ func (s *Store) AppendReliable(ctx context.Context, evs []ReliableEvent) ([]Reli
 }
 
 func appendReliable(ctx context.Context, tx *sql.Tx, a *appender, ev ReliableEvent, now int64) (ReliableResult, error) {
+	var hwKey, hwGen int64
+	switch err := tx.QueryRowContext(ctx, `SELECT key_id, session_gen FROM device_sessions WHERE device_id = ?`,
+		ev.DeviceID).Scan(&hwKey, &hwGen); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return ReliableResult{}, fmt.Errorf("eventstore: session check: %w", err)
+	case uint64(hwGen) > ev.SessionGen || (uint64(hwGen) == ev.SessionGen && uint32(hwKey) != ev.KeyID):
+		return ReliableResult{Outcome: StaleSession}, nil
+	}
 	var rpos int64
 	var fp []byte
 	var evPos sql.NullInt64

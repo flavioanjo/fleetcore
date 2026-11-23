@@ -267,3 +267,40 @@ func TestUpgradeFromSchema1(t *testing.T) {
 	}
 
 }
+
+// AppendReliable re-checks each event's session against the durable
+// high-water mark in its own transaction (see the gateway test
+// TestReliableSessionAdvancedBetweenAdmitAndCommit for the interleaving).
+func TestAppendReliableRejectsSupersededSession(t *testing.T) {
+	st := openStore(t, tempDB(t))
+	ctx := context.Background()
+	// No recorded session: not checked.
+	if r := appendRel(t, st, relEvent(t, "dev-9", 1, reliable.Diagnostic{Code: 1}))[0]; r.Outcome != Inserted {
+		t.Fatalf("device without a session: %v", r.Outcome)
+	}
+	if _, err := st.ObserveSession(ctx, "dev-1", 1, 4, t0, "gw-b"); err != nil {
+		t.Fatal(err)
+	}
+	old := relEvent(t, "dev-1", 1, reliable.Panic{Trigger: reliable.PanicButton}) // session 3
+	rekeyed := relEvent(t, "dev-1", 2, reliable.Diagnostic{Code: 1})
+	rekeyed.SessionGen, rekeyed.KeyID = 4, 2
+	current := relEvent(t, "dev-1", 3, reliable.Diagnostic{Code: 1})
+	current.SessionGen = 4
+	res := appendRel(t, st, old, rekeyed, current)
+	if res[0].Outcome != StaleSession || res[1].Outcome != StaleSession || res[2].Outcome != Inserted {
+		t.Fatalf("outcomes %v %v %v", res[0].Outcome, res[1].Outcome, res[2].Outcome)
+	}
+	for _, uid := range []uint64{1, 2} {
+		if _, err := st.GetReliable(ctx, "dev-1", uid); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("stale event %d written: %v", uid, err)
+		}
+	}
+	// A retransmission of the stale event in the current session is stored.
+	old.SessionGen = 4
+	if r := appendRel(t, st, old)[0]; r.Outcome != Inserted {
+		t.Fatalf("retransmission in the current session: %v", r.Outcome)
+	}
+	if s, _ := st.DeviceSession(ctx, "dev-1"); s.SessionGen != 4 {
+		t.Fatalf("high-water mark changed to %d", s.SessionGen)
+	}
+}
