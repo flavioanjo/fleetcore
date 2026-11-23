@@ -90,9 +90,22 @@ type Config struct {
 	// Retry backoff of failed notifications. Defaults 1s doubling to 1m.
 	InitialBackoff, MaxBackoff time.Duration
 	Batch                      int
-	Now                        func() time.Time
-	Logger                     *slog.Logger
+	// Interval is the Run loop period. Default 200ms.
+	Interval time.Duration
+	// StepTimeout bounds one Run step (including Sink.Notify). Steps are not
+	// interrupted by a stop request. Default 30s.
+	StepTimeout time.Duration
+	// MaxConsecutiveFailures is how many Run steps in a row may fail before
+	// Run returns ErrFailed. Default 25.
+	MaxConsecutiveFailures int
+	Now                    func() time.Time
+	Logger                 *slog.Logger
 }
+
+// ErrFailed is returned by Run when alert processing can no longer make
+// progress: critical events are no longer being handed to the sink, and
+// the supervising process must know.
+var ErrFailed = errors.New("alerting: persistent failure; critical events are not being processed")
 
 // Consumer moves critical events from the event store to the sink.
 type Consumer struct {
@@ -114,6 +127,15 @@ func Open(ctx context.Context, cfg Config) (*Consumer, error) {
 	if cfg.Batch <= 0 {
 		cfg.Batch = 256
 	}
+	if cfg.Interval <= 0 {
+		cfg.Interval = 200 * time.Millisecond
+	}
+	if cfg.StepTimeout <= 0 {
+		cfg.StepTimeout = 30 * time.Second
+	}
+	if cfg.MaxConsecutiveFailures <= 0 {
+		cfg.MaxConsecutiveFailures = 25
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -127,8 +149,41 @@ func Open(ctx context.Context, cfg Config) (*Consumer, error) {
 	return &Consumer{cfg: cfg, db: db}, nil
 }
 
-// Close closes the database.
+// Close closes the database. Call it only after Run has returned.
 func (c *Consumer) Close() error { return c.db.Close() }
+
+// Run calls Step every Interval until ctx is cancelled; it then returns
+// nil. A stop request is honoured between steps: the step in progress
+// completes (bounded by StepTimeout), so a notification the sink accepted
+// is recorded as such rather than repeated after a restart. Run returns an
+// error wrapping ErrFailed after MaxConsecutiveFailures failed steps.
+func (c *Consumer) Run(ctx context.Context) error {
+	t := time.NewTicker(c.cfg.Interval)
+	defer t.Stop()
+	failures := 0
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.StepTimeout)
+		_, _, err := c.Step(sctx)
+		cancel()
+		if err != nil {
+			failures++
+			c.cfg.Logger.Warn("alerting: step failed", "err", err, "consecutive_failures", failures)
+			if failures >= c.cfg.MaxConsecutiveFailures {
+				return fmt.Errorf("%w (%d consecutive failures; last: %v)", ErrFailed, failures, err)
+			}
+		} else {
+			failures = 0
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+	}
+}
 
 // Step ingests new critical events (opening alerts atomically with the
 // cursor) and notifies due alerts. It returns how many were opened and
