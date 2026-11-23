@@ -57,6 +57,22 @@ jobs:
         if: runner.os == 'Linux'
         run: go test -run='^$' -fuzz=FuzzOrderer -fuzztime=30s ./internal/chrono
 
+      - name: Fuzz protocol v2 frames (short)
+        if: runner.os == 'Linux'
+        run: go test -run='^$' -fuzz='^FuzzOpen$' -fuzztime=30s ./internal/reliable
+
+      - name: Fuzz protocol v2 event payloads (short)
+        if: runner.os == 'Linux'
+        run: go test -run='^$' -fuzz='^FuzzEventPayload$' -fuzztime=30s ./internal/reliable
+
+      - name: Fuzz protocol v2 downlink payloads (short)
+        if: runner.os == 'Linux'
+        run: go test -run='^$' -fuzz='^FuzzDownlink$' -fuzztime=30s ./internal/reliable
+
+      - name: Reliable communications demo
+        if: runner.os == 'Linux'
+        run: go run ./cmd/fleet-reliable-demo > demo.txt && grep -q "retries never repeat execution" demo.txt
+
       - name: Build without cgo
         run: go build ./...
         env:

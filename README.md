@@ -119,6 +119,37 @@ go run ./cmd/fleet-processor -events events.db -results results.db
 - **Current results:** `SELECT * FROM latest_estimates` in the results
   database.
 
+## Reliable communications and commands
+
+Protocol v2 adds authenticated, acknowledged event delivery and an
+end-to-end vehicle command lifecycle (BLOCK, UNBLOCK, OPEN_CARGO,
+REQUEST_POSITION; PANIC, POSITION, BLOCK_STATE, CARGO_STATE and
+COMMAND_RESULT events). See [docs/reliable.md](docs/reliable.md) (design,
+guarantees, threat model) and [docs/protocol-v2.md](docs/protocol-v2.md)
+(wire format). Version 1 is unchanged.
+
+```bash
+go run ./cmd/fleet-reliable-demo                       # narrated, deterministic simulated scenarios
+
+go run ./cmd/fleet-command keygen -dir data -devices TRK-1
+go run ./cmd/fleet-server -listen 127.0.0.1:7500 -data data -keys data/keys.json -authority data/authority.json &
+go run ./cmd/fleet-device -id TRK-1 -keys data/keys.json -authority-pub data/authority.pub     -gateway 127.0.0.1:7500 -db data/device-TRK-1.db -panic-after 3s &
+go run ./cmd/fleet-command request -data data -principal ops:alice -roles security_operator     -device TRK-1 -type BLOCK -reason "theft report"
+go run ./cmd/fleet-command list -data data
+```
+
+- **ACK means durably stored.** A gateway acknowledges an event only after
+  the event store committed it (or holds an identical one); devices keep
+  every event until such an ACK. Retransmissions are stored and fused once.
+- **Commands execute at most once** per CommandID, only if signed by the
+  command authority (Ed25519, separate from the transport keys), and only
+  under simulated safety interlocks. Outcomes are explicit: succeeded,
+  failed, rejected, expired or **unknown** — never guessed.
+- **A PANIC is handled only when an operator acknowledges it**; storage and
+  notification are earlier, separate states.
+- **Simulated actuators only.** Real vehicle actuation needs independent
+  safety engineering and hardware validation (see docs/reliable.md).
+
 ## Requirements
 
 - Go 1.23 or later.
@@ -193,6 +224,13 @@ go vet ./...
 go test -run='^$' -fuzz=FuzzDecodeSample -fuzztime=60s ./internal/protocol
 go test -run='^$' -fuzz=FuzzObserve -fuzztime=60s ./internal/sessions
 go test -run='^$' -fuzz=FuzzOrderer -fuzztime=60s ./internal/chrono
+go test -run='^$' -fuzz='^FuzzOpen$' -fuzztime=60s ./internal/reliable          # protocol v2 frames
+go test -run='^$' -fuzz='^FuzzEventPayload$' -fuzztime=60s ./internal/reliable
+go test -run='^$' -fuzz='^FuzzDownlink$' -fuzztime=60s ./internal/reliable
+
+# Reliable communications: soak test (hours of simulated time) and benchmarks
+FLEETCORE_SOAK=1 go test -run TestSoak -timeout 60m ./internal/simnet
+go test -run '^$' -bench 'SealOpen|ReliableIngest|CommandDelivery' ./internal/reliable ./internal/gateway ./internal/dispatcher
 
 # Regenerate the simulator golden file after an intentional model change
 go test ./internal/simulator -run Golden -update
@@ -220,7 +258,11 @@ fleetcore/
 │   ├── fleet-fusion/       CLI: fuse JSON Lines telemetry into estimates
 │   ├── fleet-eval/         CLI: accuracy evaluation table
 │   ├── fleet-gateway/      UDP ingestion gateway with SQLite storage
-│   └── fleet-processor/    chronological processor: store → fusion → results
+│   ├── fleet-processor/    chronological processor: store → fusion → results
+│   ├── fleet-server/       protocol v2 gateways + command dispatcher + alerting
+│   ├── fleet-device/       simulated v2 tracking device over UDP
+│   ├── fleet-command/      keys, command requests, lifecycle inspection, alerts
+│   └── fleet-reliable-demo/ narrated simulated scenarios
 ├── internal/
 │   ├── telemetry/          domain model and validation
 │   ├── protocol/           binary wire format
@@ -233,14 +275,25 @@ fleetcore/
 │   ├── sqlitedb/           shared SQLite configuration and migrations
 │   ├── chrono/             deterministic chronological orderer
 │   ├── resultstore/        processing journal, estimates and diagnostics (SQLite)
-│   └── processor/          event store → orderer → fusion → results
+│   ├── processor/          event store → orderer → fusion → results
+│   ├── security/           HKDF message keys, key store, command authority, replay window
+│   ├── reliable/           protocol v2 codec (events, ACKs, commands)
+│   ├── device/             simulated device: durable outbox, command execution
+│   ├── simhw/              simulated vehicle hardware (ground truth)
+│   ├── commandstore/       durable command lifecycle and audit (SQLite)
+│   ├── dispatcher/         command delivery and report application
+│   ├── alerting/           critical-event boundary (PANIC, security violations)
+│   ├── simnet/             deterministic simulated world and acceptance scenarios
+│   └── e2e/                end-to-end tests over real UDP
 ├── docs/
 │   ├── architecture.md     architectural decisions
 │   ├── fusion.md           fusion engine design and evaluation
 │   ├── ingestion.md        ingestion pipeline: identity, backpressure, storage
 │   ├── integration.md      differences between ingestion and fusion
 │   ├── processing.md       end-to-end processing: chronology, journal, recovery
-│   └── protocol.md         wire format specification
+│   ├── protocol.md         wire format specification (version 1)
+│   ├── protocol-v2.md      reliable protocol specification (version 2)
+│   └── reliable.md         reliable communications: design, guarantees, threat model
 ├── .github/workflows/ci.yml
 ├── COPYRIGHT
 └── go.mod
@@ -255,6 +308,8 @@ Done:
   Store~~ ([docs/ingestion.md](docs/ingestion.md)).
 - ~~End-to-end integration and event chronology~~
   ([docs/processing.md](docs/processing.md)).
+- ~~Reliable communications and command delivery~~ (protocol v2, command
+  dispatcher, simulated devices; [docs/reliable.md](docs/reliable.md)).
 
 Planned, not implemented. See [docs/architecture.md](docs/architecture.md)
 for where each piece is expected to fit.
@@ -264,9 +319,11 @@ for where each piece is expected to fit.
 2. **Shared session tracking:** one session model for ingestion and fusion.
 3. **Diagnostics and Observability:** metrics and structured logs, fed by
    fusion and ingestion diagnostics.
-4. **Command Dispatcher** and **Firmware Transfer Service:** downlink
-   messages (protocol v2).
+4. **Firmware Transfer Service** over the v2 downlink.
 5. **Event Replicator:** replicate stored events to other consumers.
+6. **Reliable communications hardening:** payload confidentiality (AEAD),
+   keys in a secure element / HSM, an identity provider and dual control for
+   actuations, retention and archival of the command and event audit trail.
 
 ## Copyright
 

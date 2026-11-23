@@ -63,8 +63,9 @@ never packs several frames into one buffer).
 CRC-32C detects all single-bit and burst errors up to 32 bits, is in the Go
 standard library, and is hardware-accelerated on common CPUs. It protects
 against **accidental corruption only**: it is not authentication. Message
-authentication is a deliberate non-goal of version 1 and is expected to be
-added at the transport/session layer (see the roadmap in the README).
+authentication is a deliberate non-goal of version 1. It is provided by
+protocol version 2 ([protocol-v2.md](protocol-v2.md)), which carries a
+version-1 sample unchanged inside an authenticated, acknowledged frame.
 
 ## Decoding order
 

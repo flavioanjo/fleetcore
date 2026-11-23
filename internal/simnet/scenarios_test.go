@@ -3,6 +3,9 @@ package simnet
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math/rand"
+	"os"
 	"testing"
 	"time"
 
@@ -605,4 +608,130 @@ func TestScenarioBlockRefusedWhileMoving(t *testing.T) {
 	if c.DeviceReason != reliable.ReasonVehicleMoving || d.Vehicle.Truth().ImmobilizerDrives != 0 {
 		t.Fatalf("command %+v truth %+v", c, d.Vehicle.Truth())
 	}
+}
+
+// TestSoak is a long simulated run (enable with FLEETCORE_SOAK=1): many
+// devices, impaired network, periodic gateway reboots, device crashes and
+// commands, for hours of simulated time. Invariants: every queued event
+// acknowledged and stored once; every actuation executed at most once per
+// command; no command left in a non-final state without attention.
+func TestSoak(t *testing.T) {
+	if os.Getenv("FLEETCORE_SOAK") == "" {
+		t.Skip("set FLEETCORE_SOAK=1 to run the soak test")
+	}
+	hours := 2
+	w := newWorld(t, 99, func(c *device.Config) { c.InitialBackoff, c.MaxBackoff = time.Second, 20*time.Second })
+	w.Net.Up = Faults{Loss: 0.15, Duplicate: 0.05, Delay: 50 * time.Millisecond, Jitter: time.Second}
+	w.Net.Down = Faults{Loss: 0.15, Duplicate: 0.05, Delay: 50 * time.Millisecond, Jitter: time.Second}
+	ctx := context.Background()
+	var devs []*DeviceNode
+	for i := 0; i < 20; i++ {
+		devs = append(devs, addDevice(t, w, fmt.Sprintf("TRK-%02d", i)))
+	}
+	queued := map[string]map[uint64]bool{}
+	var cmds []commandstore.Command
+	rnd := rand.New(rand.NewSource(99))
+	start := w.Now()
+	for w.Now().Sub(start) < time.Duration(hours)*time.Hour {
+		for _, d := range devs {
+			if d.Dev == nil {
+				continue
+			}
+			if rnd.Intn(20) == 0 {
+				var u uint64
+				var err error
+				if rnd.Intn(10) == 0 {
+					u, err = d.Dev.Panic(ctx)
+				} else {
+					u, err = d.Dev.Enqueue(ctx, func(uint64, time.Time) (reliable.Body, error) { return reliable.Diagnostic{Code: 2}, nil })
+				}
+				if err == nil {
+					if queued[d.ID] == nil {
+						queued[d.ID] = map[uint64]bool{}
+					}
+					queued[d.ID][u] = true
+				}
+			}
+			if rnd.Intn(2000) == 0 {
+				d.Crash()
+				d.Start() //nolint:errcheck
+			}
+			if rnd.Intn(4000) == 0 {
+				d.Gateway = 1 - d.Gateway
+			}
+		}
+		if rnd.Intn(3000) == 0 {
+			w.Gateways[rnd.Intn(2)].Reboot() //nolint:errcheck
+		}
+		if rnd.Intn(400) == 0 {
+			d := devs[rnd.Intn(len(devs))]
+			typ := []reliable.CommandType{reliable.CommandBlock, reliable.CommandUnblock, reliable.CommandRequestPosition}[rnd.Intn(3)]
+			p := secOp
+			var args []byte
+			if typ == reliable.CommandRequestPosition {
+				args = reliable.PositionArgs(time.Minute)
+			}
+			if c, err := w.Request(fmt.Sprintf("soak-%d", len(cmds)), p, d.ID, typ, args, 5*time.Minute); err == nil {
+				cmds = append(cmds, c)
+			}
+		}
+		if err := w.Step(step); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Net.Up, w.Net.Down = Faults{}, Faults{}
+	ok, _ := w.RunUntil(30*time.Minute, step, func() bool {
+		for _, d := range devs {
+			if q, _ := d.Dev.Queue(ctx); q.PendingTotal() > 0 {
+				return false
+			}
+		}
+		return true
+	})
+	if !ok {
+		t.Fatal("queues not drained after the soak")
+	}
+	mustRun(t, w, 10*time.Minute) // let deadlines and reports settle
+	events := 0
+	for _, d := range devs {
+		for u := range queued[d.ID] {
+			events++
+			if st, _, _ := d.Dev.EventState(ctx, u); st != "acked" {
+				t.Fatalf("%s/%d %s", d.ID, u, st)
+			}
+			if _, err := w.Events.GetReliable(ctx, d.ID, u); err != nil {
+				t.Fatalf("%s/%d not stored", d.ID, u)
+			}
+		}
+	}
+	states := map[commandstore.State]int{}
+	for _, c := range cmds {
+		got := w.Command(c.ID)
+		states[got.State]++
+		if !got.State.Final() && !got.NeedsAttention {
+			t.Fatalf("command %s left %s without attention", got.ID, got.State)
+		}
+		if got.State == commandstore.Unknown {
+			at, _ := w.Commands.Attempts(ctx, got.ID)
+			outcomes := map[string]int{}
+			for _, a := range at {
+				outcomes[a.Outcome]++
+			}
+			stage, _, known := w.Devices[got.DeviceID].Dev.CommandStage(ctx, got.ID)
+			t.Logf("unknown %s %s: %q; attempts %v; device knows it: %v (stage %s)", got.Type, got.DeviceID, got.StateReason, outcomes, known, stage)
+			if known && stage.Final() && w.Command(got.ID).State == commandstore.Unknown && got.DeviceStage != reliable.StageUnknown {
+				t.Errorf("device has a final stage %s but the server still shows unknown", stage)
+			}
+		}
+	}
+	drives := 0
+	for _, d := range devs {
+		drives += d.Vehicle.Truth().ImmobilizerDrives
+	}
+	actuations := states[commandstore.Succeeded] + states[commandstore.Failed] + states[commandstore.Unknown]
+	if drives > len(cmds) {
+		t.Fatalf("%d immobilizer drives for %d commands", drives, len(cmds))
+	}
+	t.Logf("soak: %d h simulated, %d events, %d commands %v, %d immobilizer drives (<= %d possible), net dropped %d duplicated %d",
+		hours, events, len(cmds), states, drives, actuations, w.Net.Dropped, w.Net.Duplicated)
 }
