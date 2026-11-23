@@ -56,14 +56,30 @@ type Config struct {
 	Batch int
 	// Interval is the Run loop period. Default 200ms.
 	Interval time.Duration
-	Now      func() time.Time
-	Logger   *slog.Logger
+	// IterationTimeout bounds one Run iteration (apply reports, then one
+	// dispatch step). Iterations are not interrupted by a stop request; this
+	// bound keeps a stuck store from delaying shutdown forever. Default 30s.
+	IterationTimeout time.Duration
+	// MaxConsecutiveFailures is how many Run iterations in a row may fail
+	// before Run gives up and returns ErrFailed. Default 25 (about 5s of
+	// failures at the default Interval, plus the store's busy timeouts).
+	MaxConsecutiveFailures int
+	Now                    func() time.Time
+	Logger                 *slog.Logger
 }
+
+// ErrFailed is returned by Run when the dispatcher can no longer make
+// progress (MaxConsecutiveFailures iterations in a row failed): command
+// delivery has stopped and the process supervising it must know.
+var ErrFailed = errors.New("dispatcher: persistent failure; command delivery stopped")
 
 // Dispatcher runs the command lifecycle.
 type Dispatcher struct {
 	cfg Config
 	log *slog.Logger
+	// beforeIteration, when set by tests, runs at the start of each Run
+	// iteration; an error fails that iteration.
+	beforeIteration func() error
 }
 
 // New validates cfg.
@@ -84,6 +100,10 @@ func New(cfg Config) (*Dispatcher, error) {
 	defD(&cfg.MaxBackoff, 30*time.Second)
 	defD(&cfg.PollInterval, 30*time.Second)
 	defD(&cfg.Interval, 200*time.Millisecond)
+	defD(&cfg.IterationTimeout, 30*time.Second)
+	if cfg.MaxConsecutiveFailures <= 0 {
+		cfg.MaxConsecutiveFailures = 25
+	}
 	if cfg.Batch <= 0 {
 		cfg.Batch = 256
 	}
@@ -215,23 +235,34 @@ func (d *Dispatcher) Apply(ctx context.Context) (int, error) {
 	return len(recs), nil
 }
 
-// Run applies reports and dispatches until ctx is cancelled.
+// Run applies reports and dispatches until ctx is cancelled; it then
+// returns nil.
+//
+// A stop request (ctx cancelled) is honoured between iterations. The
+// iteration in progress completes, bounded by IterationTimeout: in
+// particular a delivery between its write-ahead record ("sending") and its
+// outcome is never interrupted, so an orderly shutdown cannot make a
+// command's outcome falsely unknown.
+//
+// Run returns an error wrapping ErrFailed after MaxConsecutiveFailures
+// failed iterations in a row, so that a supervisor learns that command
+// delivery has stopped instead of the dispatcher logging warnings forever.
 func (d *Dispatcher) Run(ctx context.Context) error {
 	t := time.NewTicker(d.cfg.Interval)
 	defer t.Stop()
+	failures := 0
 	for {
-		for {
-			n, err := d.Apply(ctx)
-			if err != nil {
-				d.log.Warn("dispatcher: apply failed", "err", err)
-				break
-			}
-			if n < d.cfg.Batch {
-				break
-			}
+		if ctx.Err() != nil {
+			return nil
 		}
-		if _, err := d.Step(ctx); err != nil && ctx.Err() == nil {
-			d.log.Warn("dispatcher: step failed", "err", err)
+		if err := d.iteration(ctx); err != nil {
+			failures++
+			d.log.Warn("dispatcher: iteration failed", "err", err, "consecutive_failures", failures)
+			if failures >= d.cfg.MaxConsecutiveFailures {
+				return fmt.Errorf("%w (%d consecutive failures; last: %v)", ErrFailed, failures, err)
+			}
+		} else {
+			failures = 0
 		}
 		select {
 		case <-ctx.Done():
@@ -239,4 +270,33 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		case <-t.C:
 		}
 	}
+}
+
+// iteration applies pending device reports, then runs one dispatch step,
+// under a context that a stop request does not cancel.
+func (d *Dispatcher) iteration(stop context.Context) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(stop), d.cfg.IterationTimeout)
+	defer cancel()
+	if h := d.beforeIteration; h != nil {
+		if err := h(); err != nil {
+			return err
+		}
+	}
+	var applyErr error
+	for stop.Err() == nil {
+		n, err := d.Apply(ctx)
+		if err != nil {
+			applyErr = fmt.Errorf("apply: %w", err)
+			break
+		}
+		if n < d.cfg.Batch {
+			break
+		}
+	}
+	// Delivery does not depend on applying reports: run it even if that
+	// failed.
+	if _, err := d.Step(ctx); err != nil {
+		return errors.Join(applyErr, fmt.Errorf("step: %w", err))
+	}
+	return applyErr
 }
