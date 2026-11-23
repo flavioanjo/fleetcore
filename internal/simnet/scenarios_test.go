@@ -735,3 +735,29 @@ func TestSoak(t *testing.T) {
 	t.Logf("soak: %d h simulated, %d events, %d commands %v, %d immobilizer drives (<= %d possible), net dropped %d duplicated %d",
 		hours, events, len(cmds), states, drives, actuations, w.Net.Dropped, w.Net.Duplicated)
 }
+
+// Regression (found by TestSoak): a device moves from gateway A to B and
+// reboots there. A still remembers the device's previous session; the
+// dispatcher, trying A first, must not seal deliveries for that stale
+// session (the device drops them) — the command has to reach the device
+// through B.
+func TestScenarioCommandAfterRebootBehindOtherGateway(t *testing.T) {
+	w := newWorld(t, 21, nil)
+	d := addDevice(t, w, "TRK-1")
+	mustRun(t, w, 3*time.Second) // gw-a learns session 1
+	d.Gateway = 1
+	d.Crash()
+	if err := d.Start(); err != nil { // session 2, announced to gw-b only
+		t.Fatal(err)
+	}
+	mustRun(t, w, 3*time.Second)
+	blk := request(t, w, "blk", secOp, "TRK-1", reliable.CommandBlock, nil)
+	waitState(t, w, blk.ID, 30*time.Second, commandstore.Succeeded)
+	if m := d.Dev.Metrics(); m.DownlinkStale != 0 {
+		t.Fatalf("%d deliveries sealed for a stale session", m.DownlinkStale)
+	}
+	at, _ := w.Commands.Attempts(context.Background(), blk.ID)
+	if len(at) != 1 || at[0].Detail != "via gw-b" {
+		t.Fatalf("attempts %+v", at)
+	}
+}

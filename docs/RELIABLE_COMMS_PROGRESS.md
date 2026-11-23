@@ -16,11 +16,11 @@ interruption. The final state is summarised at the end.
 | 4 | `internal/commandstore`: durable command lifecycle, authorization, transitions, audit history | done |
 | 5 | Gateway reliable v2 path (`internal/gateway/reliable*.go`): authenticate, persist, ACK after commit, downlink transport | done |
 | 6 | `internal/device`: durable outbox, retries, priority, command execution with simulated hardware | done |
-| 7 | `internal/dispatcher`: dispatch loop, expiry/unknown sweeper, COMMAND_RESULT/state applier | pending |
-| 8 | `internal/alerting`: critical event consumer boundary (PANIC, security violations) | pending |
-| 9 | `internal/simnet`: deterministic network, clock, fault injection; scenario tests | pending |
-| 10 | Real UDP end-to-end tests with two gateways; CLI demos (`fleet-device`, `fleet-command`) | pending |
-| 11 | Docs (protocol v2, state machines, threat model, guarantees, limits, ADRs, README/roadmap), benchmarks, final report | pending |
+| 7 | `internal/dispatcher`: dispatch loop, expiry/unknown sweeper, COMMAND_RESULT/state applier | done |
+| 8 | `internal/alerting`: critical event consumer boundary (PANIC, security violations) | done |
+| 9 | `internal/simnet`: deterministic network, clock, fault injection; scenario tests | done |
+| 10 | Real UDP end-to-end tests with two gateways; CLI demos (`fleet-device`, `fleet-command`) | done |
+| 11 | Docs (protocol v2, state machines, threat model, guarantees, limits, ADRs, README/roadmap), benchmarks, final report | done |
 
 ## Key decisions (summary; full rationale in docs/reliable.md ADRs)
 
@@ -58,3 +58,21 @@ interruption. The final state is summarised at the end.
 - M6 done: device (outbox, priority + anti-starvation, backoff+jitter, commands with
   write-ahead execution, boot recovery), simulated hardware in internal/simhw. Found and fixed:
   NULL args for argument-less commands violated a NOT NULL constraint.
+- M7-M9 done: dispatcher, alerting, simnet with 11 acceptance scenarios. Found and fixed: commands
+  created in the same millisecond were ordered by random id (UNBLOCK could overtake BLOCK;
+  reproduced 17/30) -> explicit `seq` column.
+- Mutation testing (24 deliberate defects in device, gateway, protocol, key derivation, event
+  store, command store, alerting): 23 detected; the 24th was an equivalent mutant (a second
+  layer still rejects stale sessions) - removing both layers is detected.
+- M10 done: real UDP e2e (two gateways, crash-after-commit, failover, gateway restart, processor
+  applies every sample once); fleet-server / fleet-device / fleet-command / fleet-reliable-demo;
+  multi-process CLI flow run manually; logs checked for secrets.
+- M11 done: docs/protocol-v2.md, docs/reliable.md, README/architecture/protocol updates, CI fuzz.
+- Verification: go vet, gofmt, go test ./... (Go 1.27 and Go 1.23.0), go test -race ./... (two
+  full clean runs; one earlier run hit the Windows TempDir cleanup issue #5 after all assertions
+  passed), CGO_ENABLED=0 go test ./..., fuzz 6 targets x 45 s, soak 2 h simulated.
+- Soak run 1 (2 h simulated) passed its invariants but its diagnostics showed 5 commands
+  `unknown` after 44 transmitted attempts each that never reached the device: a gateway with a
+  stale in-memory session kept sealing deliveries for the device's previous session. Fixed in
+  the gateway (deliver only with the latest durable session / most recent gateway);
+  deterministic regression test added (failed before, passes after).

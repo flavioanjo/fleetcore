@@ -348,6 +348,13 @@ fleet-command ack -data data -device TRK-1 -uid <panic uid> -operator ops:dave -
   (first design) left a window in which a gateway that had not seen a
   reboot accepted old-session frames; the test that exposed it now passes
   without the window.
+- **ADR-R6b Deliver only through the gateway with the latest view.** A
+  gateway seals a delivery only if its remembered session is the device's
+  current one in the shared store and no other gateway heard the device more
+  recently. Found by the soak test: a device that moved to gateway B and
+  rebooted there kept receiving deliveries sealed by gateway A for its
+  previous session (dropped as stale); those commands ended `unknown`.
+  Regression: `TestScenarioCommandAfterRebootBehindOtherGateway`.
 - **ADR-R7 Write-ahead attempts and executions.** An attempt is recorded
   before transmission and an execution before actuation, so a crash can
   make an outcome unknown but never falsely expired or repeated.
@@ -366,6 +373,11 @@ fleet-command ack -data data -device TRK-1 -uid <panic uid> -operator ops:dave -
 - Principal authentication is delegated to the caller (CLI flags stand in
   for an identity provider); no dual control for actuations.
 - Device time integrity is assumed for command expiry/freshness.
+- A TELEMETRY event inherits the version-1 domain rule that device time may
+  be at most 5 minutes after the ingestion time. A device whose clock runs
+  more than 5 minutes ahead gets `AckInvalid` for its telemetry, which then
+  stays `failed` (kept, counted) on the device rather than stored. Other
+  event types do not have this rule.
 - A device that loses its durable store loses its queue and its command
   dedup records (a re-delivered command id would then be new to it; the
   authority signature and expiry still bound what can execute).

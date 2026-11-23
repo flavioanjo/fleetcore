@@ -151,6 +151,7 @@ type deviceState struct {
 	checkedAt time.Time
 	window    security.ReplayWindow
 	addr      netip.AddrPort
+	lastSeen  time.Time // last authenticated frame through this gateway
 }
 
 // ReliableStats are the v2 counters. All fields are updated atomically.
@@ -169,6 +170,7 @@ type ReliableStats struct {
 	AckSendErrors atomic.Uint64
 	CommandsSent  atomic.Uint64
 	Unreachable   atomic.Uint64
+	StaleRoutes   atomic.Uint64 // deliveries declined: this gateway's view of the device was not the latest
 	Critical      atomic.Uint64 // critical events stored or duplicate
 }
 
@@ -331,7 +333,7 @@ func (r *Reliable) admit(ctx context.Context, f reliable.Frame, from netip.AddrP
 	if d.gen != f.SessionGen || !d.window.Accept(f.Counter) {
 		return &reliable.Error{Code: reliable.CodeReplay}
 	}
-	d.addr = from
+	d.addr, d.lastSeen = from, at
 	return nil
 }
 
@@ -494,6 +496,14 @@ var ErrUnreachable = reliable.ErrDeviceUnreachable
 
 // CommandPacket seals a command delivery for the device's current session
 // and returns it with the device's last authenticated address.
+//
+// It declines (ErrUnreachable) unless this gateway's view of the device is
+// the latest one: its remembered session must be the device's current
+// session in the shared store (a device that rebooted behind another
+// gateway would drop a delivery sealed for its previous session), and no
+// other gateway may have heard the device more recently (that gateway's
+// address and NAT mapping are fresher). The dispatcher then tries the next
+// gateway.
 func (r *Reliable) CommandPacket(d reliable.CommandDelivery) (Outbound, error) {
 	r.mu.Lock()
 	e, ok := r.devices[d.DeviceID]
@@ -505,6 +515,17 @@ func (r *Reliable) CommandPacket(d reliable.CommandDelivery) (Outbound, error) {
 	if !ok || !st.addr.IsValid() || st.gen == 0 {
 		r.stats.Unreachable.Add(1)
 		return Outbound{}, ErrUnreachable
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.WriteTimeout)
+	cur, err := r.cfg.Store.DeviceSession(ctx, d.DeviceID)
+	cancel()
+	if err != nil {
+		return Outbound{}, fmt.Errorf("gateway: session of %s: %w", d.DeviceID, err)
+	}
+	if cur.SessionGen != st.gen || cur.KeyID != st.keyID ||
+		(cur.Gateway != r.cfg.GatewayID && st.lastSeen.Before(cur.LastSeen)) {
+		r.stats.StaleRoutes.Add(1)
+		return Outbound{}, fmt.Errorf("%w (its latest session or address is known to %s)", ErrUnreachable, cur.Gateway)
 	}
 	p, err := d.Encode()
 	if err != nil {
