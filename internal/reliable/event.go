@@ -550,6 +550,18 @@ const (
 	LatchUnknown  LatchState = 3
 )
 
+func (l LatchState) String() string {
+	switch l {
+	case LatchLocked:
+		return "locked"
+	case LatchReleased:
+		return "released"
+	case LatchUnknown:
+		return "unknown"
+	}
+	return fmt.Sprintf("latch(%d)", uint8(l))
+}
+
 // CargoState is a CARGO_STATE event (19 bytes): door(1) latch(1) cause(1)
 // command_id(16). Door and latch are separate sensors: a released latch
 // does not mean the door opened.

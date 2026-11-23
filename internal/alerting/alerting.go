@@ -294,3 +294,52 @@ func (c *Consumer) Unacknowledged(ctx context.Context) (int, error) {
 	err := c.db.R.QueryRowContext(ctx, `SELECT count(*) FROM alerts WHERE state <> 'acknowledged'`).Scan(&n)
 	return n, err
 }
+
+// Entry is a listed alert.
+type Entry struct {
+	DeviceID string
+	UID      uint64
+	Type     reliable.EventType
+	Status
+}
+
+// List returns alerts, not-yet-acknowledged first, then by age.
+func (c *Consumer) List(ctx context.Context, limit int) ([]Entry, error) {
+	rows, err := c.db.R.QueryContext(ctx, `SELECT device_id, event_uid, event_type FROM alerts
+		ORDER BY state = 'acknowledged', rpos LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	var out []Entry
+	for rows.Next() {
+		var e Entry
+		var uid, typ int64
+		if err := rows.Scan(&e.DeviceID, &uid, &typ); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		e.UID, e.Type = uint64(uid), reliable.EventType(typ)
+		out = append(out, e)
+	}
+	rows.Close()
+	for i := range out {
+		if out[i].Status, err = c.Get(ctx, out[i].DeviceID, out[i].UID); err != nil {
+			return nil, err
+		}
+	}
+	return out, rows.Err()
+}
+
+// LogSink is a Sink that writes alerts to a logger (the reference
+// integration point; a deployment replaces it with its incident system).
+type LogSink struct{ Logger *slog.Logger }
+
+// Notify implements Sink.
+func (s LogSink) Notify(_ context.Context, a Alert) error {
+	attrs := []any{"alert", a.ID, "type", a.Type.String(), "device_id", a.DeviceID, "device_time", a.DeviceTime, "stored_at", a.StoredAt}
+	if a.Panic != nil && a.Panic.HasPosition {
+		attrs = append(attrs, "lat_e7", a.Panic.Position.LatE7, "lon_e7", a.Panic.Position.LonE7, "position_age", a.Panic.PositionAge)
+	}
+	s.Logger.Warn("CRITICAL EVENT — needs operator acknowledgement (stored and notified; not handled)", attrs...)
+	return nil
+}

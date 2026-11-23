@@ -9,8 +9,15 @@
 // It stops gracefully on SIGINT or SIGTERM: it stops reading, stores every
 // queued event (bounded by -drain-timeout) and closes the database.
 //
-// Packets are not authenticated: their CRC-32C detects corruption only. Do
-// not expose the listener to untrusted networks.
+// Version-1 packets are not authenticated: their CRC-32C detects
+// corruption only. Do not expose the listener to untrusted networks.
+//
+// With -v2-keys, the gateway also accepts protocol v2 (authenticated,
+// acknowledged delivery; docs/protocol-v2.md): v2 events are ACKed only
+// after they are durably committed. Command delivery needs the dispatcher,
+// which runs in fleet-server.
+//
+//	fleet-gateway -listen 127.0.0.1:7400 -db events.db -v2-keys keys.json -gateway-id gw-a
 package main
 
 import (
@@ -28,6 +35,7 @@ import (
 	"github.com/flavioanjo/fleetcore/internal/eventstore"
 	"github.com/flavioanjo/fleetcore/internal/gateway"
 	"github.com/flavioanjo/fleetcore/internal/protocol"
+	"github.com/flavioanjo/fleetcore/internal/security"
 	"github.com/flavioanjo/fleetcore/internal/sessions"
 )
 
@@ -62,6 +70,8 @@ func run(ctx context.Context, args []string, stderr io.Writer, ready chan<- stri
 		statsInterval = fs.Duration("stats-interval", time.Minute, "interval between statistics log lines (0 disables)")
 		logLevel      = fs.String("log-level", "info", "log level: debug, info, warn, error")
 		logFormat     = fs.String("log-format", "json", "log format: json or text")
+		v2Keys        = fs.String("v2-keys", "", "device key file enabling protocol v2 (secret: keep it 0600, never commit it)")
+		gatewayID     = fs.String("gateway-id", "gw-1", "name of this gateway in stored v2 records")
 	)
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "usage: fleet-gateway [flags]")
@@ -112,7 +122,17 @@ func run(ctx context.Context, args []string, stderr io.Writer, ready chan<- stri
 		SessionIdleTimeout: *sessionIdle,
 		DeviceIdleTimeout:  *deviceIdle,
 	})
+	var rel *gateway.ReliableConfig
+	if *v2Keys != "" {
+		keys, err := security.LoadKeyFile(*v2Keys)
+		if err != nil {
+			logger.Error("cannot load v2 device keys", "err", err) // the error never contains key material
+			return 2
+		}
+		rel = &gateway.ReliableConfig{Keys: keys, Store: store, GatewayID: *gatewayID}
+	}
 	gw, err := gateway.New(gateway.Config{
+		Reliable:        rel,
 		Addr:            *listen,
 		MaxDatagramSize: *maxDatagram,
 		ReadBuffer:      *readBuffer,
