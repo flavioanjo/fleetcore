@@ -35,16 +35,17 @@ func TestMigrationUpgradePreservesData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	withMigrations(t, sqlitedb.Migration{Version: 2, Name: "test: add annotation", Stmts: []string{
+	next := SchemaVersion() + 1
+	withMigrations(t, sqlitedb.Migration{Version: next, Name: "test: add annotation", Stmts: []string{
 		`ALTER TABLE events ADD COLUMN annotation TEXT`,
 		`CREATE TABLE annotations_meta (k TEXT PRIMARY KEY) STRICT`,
 	}})
 	st2 := openStore(t, path)
-	if v := schemaVersion(t, st2); v != 2 {
-		t.Fatalf("schema version %d after upgrade, want 2", v)
+	if v := schemaVersion(t, st2); v != next {
+		t.Fatalf("schema version %d after upgrade, want %d", v, next)
 	}
 	if _, err := st2.r.Exec(`SELECT annotation FROM events`); err != nil {
-		t.Fatalf("migration 2 not applied: %v", err)
+		t.Fatalf("migration %d not applied: %v", next, err)
 	}
 	// Existing data and its uniqueness survive the upgrade.
 	mustAppend(t, st2, event(t, sample("dev-1", 1, 7, 1, 100)), Duplicate)
@@ -57,7 +58,7 @@ func TestMigrationUpgradePreservesData(t *testing.T) {
 		names = append(names, n)
 	}
 	rows.Close()
-	if len(names) != 2 {
+	if len(names) != next {
 		t.Fatalf("migration history %v", names)
 	}
 }
@@ -67,7 +68,7 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 	st := openStore(t, path)
 	st.Close()
 
-	withMigrations(t, sqlitedb.Migration{Version: 2, Name: "test: broken", Stmts: []string{
+	withMigrations(t, sqlitedb.Migration{Version: SchemaVersion() + 1, Name: "test: broken", Stmts: []string{
 		`CREATE TABLE partial (x INTEGER) STRICT`,
 		`THIS IS NOT SQL`,
 	}})
@@ -76,8 +77,8 @@ func TestFailedMigrationRollsBack(t *testing.T) {
 	}
 	migrations = migrations[:len(migrations)-1] // back to the real history
 	st2 := openStore(t, path)
-	if v := schemaVersion(t, st2); v != 1 {
-		t.Fatalf("schema version %d after failed migration, want 1", v)
+	if v := schemaVersion(t, st2); v != SchemaVersion() {
+		t.Fatalf("schema version %d after failed migration, want %d", v, SchemaVersion())
 	}
 	var n int
 	st2.r.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE name = 'partial'`).Scan(&n)

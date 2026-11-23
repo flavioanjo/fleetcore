@@ -59,6 +59,70 @@ var migrations = []sqlitedb.Migration{
 			) STRICT`,
 		},
 	},
+	{
+		// Protocol v2 (reliable communications). Additive only: version-1
+		// tables, rows and readers are unchanged, so a v1-only deployment can
+		// migrate at any time. See docs/reliable.md.
+		Version: 2,
+		Name:    "reliable events, conflicts and device sessions",
+		Stmts: []string{
+			// One row per (device_id, event_uid): the authoritative identity of
+			// an event delivered over protocol v2. payload is the canonical
+			// EventUpload payload; the fingerprint is reliable.EventFingerprint
+			// of it. TELEMETRY events are also stored in events (event_position)
+			// so the chronological processor and fusion consume them exactly as
+			// version-1 events.
+			`CREATE TABLE reliable_events (
+				rpos           INTEGER PRIMARY KEY AUTOINCREMENT,
+				device_id      TEXT    NOT NULL CHECK (length(device_id) BETWEEN 1 AND 32),
+				event_uid      INTEGER NOT NULL CHECK (event_uid > 0),
+				event_type     INTEGER NOT NULL CHECK (event_type BETWEEN 1 AND 8),
+				class          INTEGER NOT NULL CHECK (class BETWEEN 1 AND 5),
+				device_time_ms INTEGER NOT NULL,
+				fingerprint    BLOB    NOT NULL CHECK (length(fingerprint) = 32),
+				payload        BLOB    NOT NULL CHECK (length(payload) BETWEEN 19 AND 512),
+				event_position INTEGER REFERENCES events (position),
+				key_id         INTEGER NOT NULL CHECK (key_id > 0),
+				session_gen    INTEGER NOT NULL CHECK (session_gen > 0),
+				received_at_ns INTEGER NOT NULL,
+				stored_at_ns   INTEGER NOT NULL,
+				gateway        TEXT    NOT NULL,
+				CHECK ((event_type = 1) = (event_position IS NOT NULL)),
+				UNIQUE (device_id, event_uid)
+			) STRICT`,
+			`CREATE INDEX reliable_events_by_class ON reliable_events (class, rpos)`,
+			`CREATE TRIGGER reliable_events_immutable BEFORE UPDATE ON reliable_events
+			BEGIN
+				SELECT RAISE(ABORT, 'fleetcore: stored reliable events are immutable');
+			END`,
+			// A payload that reused a stored (device_id, event_uid), or a
+			// TELEMETRY event whose v1 identity is stored with another payload.
+			// It is preserved here and never overwrites the stored event.
+			`CREATE TABLE reliable_conflicts (
+				id            INTEGER PRIMARY KEY,
+				device_id     TEXT    NOT NULL,
+				event_uid     INTEGER NOT NULL,
+				fingerprint   BLOB    NOT NULL CHECK (length(fingerprint) = 32),
+				payload       BLOB    NOT NULL,
+				reason        TEXT    NOT NULL CHECK (reason IN ('uid_reused', 'telemetry_identity_conflict')),
+				first_seen_ns INTEGER NOT NULL,
+				last_seen_ns  INTEGER NOT NULL,
+				receipts      INTEGER NOT NULL CHECK (receipts >= 1),
+				UNIQUE (device_id, event_uid, fingerprint)
+			) STRICT`,
+			// The latest authenticated session of each device, shared by every
+			// gateway: session_gen only increases, so frames of older sessions
+			// are rejected as replays by any gateway, across restarts.
+			`CREATE TABLE device_sessions (
+				device_id     TEXT    PRIMARY KEY CHECK (length(device_id) BETWEEN 1 AND 32),
+				key_id        INTEGER NOT NULL CHECK (key_id > 0),
+				session_gen   INTEGER NOT NULL CHECK (session_gen > 0),
+				first_seen_ns INTEGER NOT NULL,
+				last_seen_ns  INTEGER NOT NULL,
+				last_gateway  TEXT    NOT NULL
+			) STRICT`,
+		},
+	},
 }
 
 // SchemaVersion is the schema version this build creates and understands.

@@ -378,13 +378,24 @@ gateways. The processor's commits do not compete with the gateways for the
 event store's write lock. Results can be rebuilt from the journal without
 touching events.
 
+## ADR-18: Reliable communications (protocol v2)
+
+Authenticated, acknowledged delivery and the command lifecycle are a
+separate protocol version and set of packages (`internal/security`,
+`internal/reliable`, `internal/device`, `internal/commandstore`,
+`internal/dispatcher`, `internal/alerting`, `internal/simnet`), with their
+own decision records ADR-R1 … ADR-R10 in [reliable.md](reliable.md). The
+event store gained schema version 2 (additive); a v2 TELEMETRY event is
+also a v1 event, so ADR-12 identity and ADR-15 processing apply unchanged.
+
 ## Reserved architectural space
 
 These components are planned but **not** implemented; no placeholder
 packages exist for them. The expected placement is listed so that current
 APIs do not block them. (The fusion engine, UDP gateway, session registry
 and event store, once listed here, are implemented as `internal/fusion`,
-`internal/gateway`, `internal/sessions` and `internal/eventstore`.
+`internal/gateway`, `internal/sessions` and `internal/eventstore`; the
+command dispatcher as `internal/dispatcher` with protocol v2, ADR-18.
 Connecting ingestion to fusion is open work; see
 [integration.md](integration.md).)
 
@@ -392,5 +403,4 @@ Connecting ingestion to fusion is open work; see
 |-----------|--------------------|-----------|
 | Diagnostics and Observability | `internal/obs` | typed `protocol.Error` codes as metric labels |
 | Firmware Transfer Service | `internal/firmware` | new protocol message types (requires protocol v2) |
-| Command Dispatcher | `internal/command` | new protocol message types |
 | Event Replicator | `internal/replicate` | event store |

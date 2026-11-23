@@ -52,11 +52,24 @@ func TestIngestionIsDecoupledFromFusion(t *testing.T) {
 		"internal/telemetry": true, "internal/protocol": true,
 		"internal/eventstore": true, "internal/sessions": true,
 		"internal/sqlitedb": true, // shared SQLite configuration (no domain logic)
+		// Protocol v2 (docs/protocol-v2.md) and its cryptographic primitives.
+		"internal/reliable": true, "internal/security": true,
 	}
 	for _, dir := range []string{".", "../eventstore", "../sessions", "../../cmd/fleet-gateway"} {
 		for imp, file := range productionImports(t, dir) {
 			if !allowed[imp] && imp != "internal/gateway" {
 				t.Errorf("%s imports %s; ingestion may only import %v", file, imp, allowed)
+			}
+		}
+	}
+	// The protocol packages themselves depend only on the domain, the v1
+	// codec and each other, so allowing them above opens no indirect path
+	// from ingestion to fusion or processing.
+	protocolOnly := map[string]bool{"internal/telemetry": true, "internal/protocol": true, "internal/security": true}
+	for _, dir := range []string{"../reliable", "../security"} {
+		for imp, file := range productionImports(t, dir) {
+			if !protocolOnly[imp] {
+				t.Errorf("%s imports %s; protocol packages may only import %v", file, imp, protocolOnly)
 			}
 		}
 	}

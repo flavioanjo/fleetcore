@@ -16,6 +16,9 @@
 //     instead of failing with lock-upgrade deadlocks.
 //   - Read pool: Options.ReadConns connections opened with query_only=ON.
 //   - Close: checkpoints and truncates the WAL, then closes both pools.
+//   - Driver: modernc.org/sqlite behind a thin wrapper (driver.go) that runs
+//     queries without context cancellation, working around a statement leak
+//     in the driver when a query is cancelled mid-step.
 package sqlitedb
 
 import (
@@ -84,7 +87,8 @@ func Open(ctx context.Context, name, path string, opts Options, migrations []Mig
 	wq := cloneValues(common)
 	wq.Add("_pragma", "journal_mode(WAL)")
 	wq.Set("_txlock", "immediate")
-	w, err := sql.Open("sqlite", path+"?"+wq.Encode())
+	registerDriver()
+	w, err := sql.Open(driverName, path+"?"+wq.Encode())
 	if err != nil {
 		return nil, fmt.Errorf("%s: open: %w", name, err)
 	}
@@ -112,7 +116,7 @@ func Open(ctx context.Context, name, path string, opts Options, migrations []Mig
 
 	rq := cloneValues(common)
 	rq.Add("_pragma", "query_only(1)")
-	r, err := sql.Open("sqlite", path+"?"+rq.Encode())
+	r, err := sql.Open(driverName, path+"?"+rq.Encode())
 	if err != nil {
 		w.Close()
 		return nil, fmt.Errorf("%s: open reader: %w", name, err)

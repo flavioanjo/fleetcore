@@ -114,6 +114,10 @@ const (
 	Inserted  Outcome = iota + 1 // new identity, stored
 	Duplicate                    // identical event already stored
 	Conflict                     // identity already stored with a different payload
+	// StaleSession (v2 events only): the event's session is older than the
+	// device's durable session high-water mark at commit time; nothing is
+	// written. See [Store.AppendReliable].
+	StaleSession
 )
 
 func (o Outcome) String() string {
@@ -124,6 +128,8 @@ func (o Outcome) String() string {
 		return "duplicate"
 	case Conflict:
 		return "conflict"
+	case StaleSession:
+		return "stale_session"
 	default:
 		return fmt.Sprintf("outcome(%d)", uint8(o))
 	}
