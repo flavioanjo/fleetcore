@@ -41,8 +41,11 @@ func (w *ReplayWindow) Accept(ctr uint64) bool {
 		if shift >= WindowSize {
 			w.bits = [WindowSize / 64]uint64{}
 		} else {
-			for c := w.top + 1; c <= ctr; c++ {
-				w.clear(c)
+			// Iterate over the bounded offset, never over the counter
+			// itself: top+i <= ctr cannot overflow, while a loop on
+			// "c <= ctr" never ends when ctr is math.MaxUint64.
+			for i := uint64(1); i <= shift; i++ {
+				w.clear(w.top + i)
 			}
 		}
 		w.top = ctr
