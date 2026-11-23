@@ -84,3 +84,30 @@ interruption. The final state is summarised at the end.
 
 All milestones done and committed on `feature/reliable-communications` (not pushed, not merged).
 See the final report in the session and docs/reliable.md for guarantees and known limitations.
+
+## Audit remediation (after the independent audit of 6a8a229)
+
+Each confirmed defect has a regression test that failed before its fix (output recorded in the
+commit messages) and passes after. Local commits only.
+
+| Defect (audit item) | Cause | Fix | Commit |
+|---|---|---|---|
+| Replay window never terminates at `MaxUint64` (P1) | clearing loop `c <= ctr` wraps | iterate over the bounded offset | 7b139ec |
+| Telemetry sequence advanced by rejected enqueues (P1) | increment inside the body builder, before capacity check / encode / commit | advance only after commit | 4c9ed40 |
+| Session N event stored after another gateway recorded N+1 (P1) | admission and insert in separate transactions | session re-checked in the insert transaction; new outcome `StaleSession` | 33e51e8 |
+| SQLite files held after shutdown (P0) | modernc.org/sqlite v1.38.2 leaks the statement of a query cancelled mid-step; the dropped connection becomes a zombie | driver wrapper: queries run without cancellation | 8321718 |
+| Dispatcher failures invisible; stop leaves attempts "sending" (P0) | errors swallowed; stop cancelled the delivery in progress | `ErrFailed` after consecutive failures; iterations not interrupted | 5c41803 |
+| Alerting had no supervised loop (P0) | Step called with the process context | `Consumer.Run` with the same semantics | 0cd5f67 |
+| Server kept running with a stopped essential service (P0) | dispatcher result discarded | supervisor; exit 1 naming the service; stores closed after services | 7db15e4 |
+| Orderly stop during actuation reported as interrupted (found here) | outcome commit used the caller's context | outcome recorded under `WithoutCancel`; fleet-device waits for its receiver | 3d4a216 |
+| Blank / control-character principals accepted (found by the new matrix test) | only emptiness and length checked | printable UTF-8, no surrounding spaces | 6036f44 |
+| Demo-only boundaries implicit (P1) | — | `-unverified-demo-identity`, LogSink wording, README blockers, reliable.md §10 | f33f6c9 |
+
+Verification of f33f6c9 (Windows, Go 1.27; Go 1.23.0 where noted): gofmt, vet, `go test ./...`,
+`CGO_ENABLED=0`, Go 1.23.0 pass; shutdown tests 10x (+3x with `-race`), sqlite cancellation 20x,
+e2e 10x, simnet 5x, stop-safety 20x, session race 50x pass; six fuzz targets 30 s each (about
+21 M executions) without failure; demo passes; soak: 2 h simulated, 14 474 events stored once,
+37 commands (24 succeeded, 13 failed, 0 unknown). Full-suite `-race`: no data race; the v1 test
+`TestConcurrentDevicesOverUDP` timed out under full parallel load in 3 of 3 runs on this branch and
+in 1 of 2 runs on 6a8a229 (passes 10/10 alone on both): pre-existing, not fixed here.
+Cost: batch-64 ingestion about 9% slower (one session lookup per event in the insert transaction).
