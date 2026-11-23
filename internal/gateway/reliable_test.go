@@ -270,3 +270,21 @@ func TestReliableCommandPacketUsesCurrentSession(t *testing.T) {
 		t.Fatalf("delivery under another key: %v", err)
 	}
 }
+
+func newRelFixtureB(b *testing.B) *relFixture {
+	path := filepath.Join(b.TempDir(), "events.db")
+	st, err := eventstore.Open(context.Background(), path, eventstore.Options{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { st.Close() })
+	return &relFixture{ks: security.NewMemoryKeyStore(), store: st, path: path}
+}
+
+func (f *relFixture) coreB(b *testing.B) *Reliable {
+	r, err := NewReliable(ReliableConfig{Keys: f.ks, Store: f.store, GatewayID: "gw-bench"}, time.Now, quietLogger())
+	if err != nil {
+		b.Fatal(err)
+	}
+	return r
+}
