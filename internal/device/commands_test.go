@@ -325,3 +325,41 @@ func TestPanicCarriesLastValidFix(t *testing.T) {
 		t.Fatalf("panic %+v", p)
 	}
 }
+
+// Regression: an orderly stop (the caller's context cancelled while the
+// actuator is being driven) used to abort the outcome commit, so the next
+// boot reported the command unknown/interrupted although the device never
+// crashed. Once the execution decision is committed, the outcome is
+// recorded regardless of the caller's cancellation; only a real crash can
+// leave it unrecorded.
+func TestStopDuringExecutionRecordsTheOutcome(t *testing.T) {
+	var cancel context.CancelFunc
+	r := newRig(t, func(c *device.Config) {
+		c.Hooks = &device.Hooks{DuringExecution: func(reliable.CommandID) error {
+			cancel() // SIGTERM while the immobilizer is being driven
+			return nil
+		}}
+	})
+	r.exchange(false)
+	blk := r.command(reliable.CommandBlock, nil, time.Minute, r.auth)
+	o, err := r.gw.CommandPacket(blk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ctx context.Context
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+	if err := r.dev.HandleDownlink(ctx, o.Data); err != nil {
+		t.Fatalf("orderly stop during execution: %v", err)
+	}
+	if st, reason, _ := r.dev.CommandStage(context.Background(), blk.ID); st != reliable.StageSucceeded {
+		t.Fatalf("outcome %s %s, want succeeded", st, reason)
+	}
+	r.start() // restart after the stop
+	if st, reason, _ := r.dev.CommandStage(context.Background(), blk.ID); st != reliable.StageSucceeded {
+		t.Fatalf("after restart: %s %s (an orderly stop must not look like a crash)", st, reason)
+	}
+	if tr := r.veh.Truth(); tr.ImmobilizerDrives != 1 {
+		t.Fatalf("actuator driven %d times", tr.ImmobilizerDrives)
+	}
+}

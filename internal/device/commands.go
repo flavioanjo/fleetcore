@@ -108,6 +108,12 @@ func (d *Device) handleCommand(ctx context.Context, cd reliable.CommandDelivery)
 		return d.queueStates(ctx, cd, reliable.CauseCommand)
 	}
 
+	// From here the actuator may move. Its outcome is recorded whatever the
+	// caller does with ctx: an orderly stop must not make the command look
+	// interrupted (unknown) at the next boot. Only a crash can leave the
+	// outcome unrecorded. Nothing below waits on ctx.
+	ctx = context.WithoutCancel(ctx)
+
 	// Execute (step 5).
 	final, freason, obs := d.execute(ctx, cd)
 	if h := d.cfg.Hooks; h != nil && h.DuringExecution != nil {

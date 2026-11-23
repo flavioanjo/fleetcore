@@ -154,7 +154,18 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		ctx, cancel = context.WithTimeout(ctx, *duration)
 		defer cancel()
 	}
-	go udp.Receive(ctx, d) //nolint:errcheck
+	// The receive goroutine handles command deliveries; it must have
+	// returned before the store is closed (a command being executed records
+	// its outcome first).
+	recvDone := make(chan struct{})
+	go func() {
+		defer close(recvDone)
+		udp.Receive(ctx, d) //nolint:errcheck
+	}()
+	defer func() {
+		udp.Close()
+		<-recvDone
+	}()
 
 	start := time.Now()
 	tick := time.NewTicker(100 * time.Millisecond)
