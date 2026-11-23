@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -383,5 +385,57 @@ func TestDeviceReportedStateKeepsLatestByUID(t *testing.T) {
 	st, _ := f.store.DeviceReportedState(ctx, "DEV-1")
 	if st.Block != reliable.Blocked {
 		t.Fatalf("reported state %v, want blocked", st.Block)
+	}
+}
+
+// Full authorization matrix of the default policy, plus identity edge
+// cases. A denied request is audited and nothing is stored or signed.
+func TestAuthorizationMatrix(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	types := []reliable.CommandType{reliable.CommandBlock, reliable.CommandUnblock, reliable.CommandOpenCargo, reliable.CommandRequestPosition}
+	allowed := map[string]map[reliable.CommandType]bool{
+		"security_operator":  {reliable.CommandBlock: true, reliable.CommandUnblock: true},
+		"cargo_operator":     {reliable.CommandOpenCargo: true},
+		"fleet_viewer":       {reliable.CommandRequestPosition: true},
+		"fleet_admin":        {}, // unknown to the policy: grants nothing
+		"SECURITY_OPERATOR":  {}, // roles are exact strings
+		" security_operator": {},
+	}
+	n, denied := 0, 0
+	for role, ok := range allowed {
+		for _, typ := range types {
+			n++
+			r := req(fmt.Sprintf("m%d", n), Principal{ID: "ops:x", Roles: []string{role}}, "DEV-1", typ)
+			_, _, err := f.store.Create(ctx, r)
+			switch {
+			case ok[typ] && err != nil:
+				t.Fatalf("%s by %q refused: %v", typ, role, err)
+			case !ok[typ] && !errors.Is(err, ErrUnauthorized):
+				t.Fatalf("%s by %q: %v, want ErrUnauthorized", typ, role, err)
+			case !ok[typ]:
+				denied++
+			}
+		}
+	}
+	sec := []string{"security_operator"}
+	for _, p := range []Principal{{ID: "ops:nobody"}, {ID: "", Roles: sec}, {ID: "  ", Roles: sec}, {ID: "ops:alice ", Roles: sec},
+		{ID: "ops:alice\nrequested by ops:root", Roles: sec}, {ID: "ops:\x00x", Roles: sec}, {ID: "ops:\xff", Roles: sec},
+		{ID: strings.Repeat("a", 65), Roles: sec}} {
+		n++
+		_, _, err := f.store.Create(ctx, req(fmt.Sprintf("m%d", n), p, "DEV-1", reliable.CommandBlock))
+		if err == nil {
+			t.Fatalf("principal %+v accepted", p)
+		}
+		if errors.Is(err, ErrUnauthorized) {
+			denied++
+		}
+	}
+	if got, _ := f.store.DeniedCount(ctx); got != denied {
+		t.Fatalf("denied audit %d, want %d", got, denied)
+	}
+	all, _ := f.store.List(ctx, Filter{})
+	if len(all) != 4 {
+		t.Fatalf("%d commands stored, want 4 (one per allowed role and type)", len(all))
 	}
 }

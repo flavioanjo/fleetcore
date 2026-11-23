@@ -42,6 +42,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/flavioanjo/fleetcore/internal/reliable"
 	"github.com/flavioanjo/fleetcore/internal/security"
@@ -263,12 +265,28 @@ func fromMs(v sql.NullInt64) time.Time {
 	return time.UnixMilli(v.Int64).UTC()
 }
 
+// validPrincipal accepts identities that are unambiguous in the audit
+// trail and in logs: non-empty, bounded, valid UTF-8, printable (no control
+// characters that could forge audit or log lines) and without leading or
+// trailing spaces (so "ops:alice" and "ops:alice " are not two principals).
+func validPrincipal(id string) bool {
+	if id == "" || len(id) > reliable.MaxPrincipal || !utf8.ValidString(id) || strings.TrimSpace(id) != id {
+		return false
+	}
+	for _, r := range id {
+		if !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Store) validate(req Request) error {
 	switch {
 	case req.RequestID == "" || len(req.RequestID) > 128:
 		return fmt.Errorf("%w: request id must be 1..128 bytes", ErrInvalidRequest)
-	case req.Principal.ID == "" || len(req.Principal.ID) > reliable.MaxPrincipal:
-		return fmt.Errorf("%w: principal id must be 1..%d bytes", ErrInvalidRequest, reliable.MaxPrincipal)
+	case !validPrincipal(req.Principal.ID):
+		return fmt.Errorf("%w: principal id must be 1..%d bytes of printable UTF-8 without surrounding spaces", ErrInvalidRequest, reliable.MaxPrincipal)
 	case telemetry.DeviceID(req.DeviceID).Validate() != nil:
 		return fmt.Errorf("%w: device id", ErrInvalidRequest)
 	case !req.Type.Valid():
